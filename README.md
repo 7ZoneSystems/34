@@ -143,58 +143,42 @@ conn.commit(); conn.close()
 Student Question
        |
        v
-  [D2] Classifier
-  Is it in the syllabus? Is it a repeat?
+  [Memory DB] — stores input
        |
-  +---------+---------+---------+
-  |         |         |         |
-YES+NEW   YES+REPEAT  NO+NEW   NO+REPEAT
-  |         |         |         |
-  v         v         v         v
-Mentor    [D1]      [D2.1]    [D2.1]
-Router    Aggreg.   WebSearch  WebSearch
-  |         |         |         |
-  v         v         v         v
-  |       Mentor    Match?    Match?
-  |       Router    Y->Mentor  Y->Mentor
-  |         |       N->D4      N->D4
-  v         v         v         v
- [Session Memory DB — all results stored]
-                         |
-                         v
-                    [D4] Curiosity Guide
-                    (xAI Grok powered)
-                    - Curiosity pattern?
-                    - Novel query classification
-                    - Mock web search
-                    - Guide mode output
-                         |
-                         v
-              [D3] Output Safety Check
-              - Policy DB validation
-              - Blocked patterns
-              - Content rules
-              - Retry up to 2x
-              - Fail → mentor review
-                         |
-                    +----+----+
-                    |         |
-                  SAFE    UNSAFE (after 2 retries)
-                    |         |
-                    v         v
-                Student    "Your query is
-                sees       waiting for mentor
-                response   review"
+       v
+  [D2] Classifier — syllabus match? repeat?
+       |
+  +----+----+
+  |         |
+  MATCH    NO MATCH
+  |         |
+  v         v
+ [D1]     [D2.1] Web Search
+ Aggreg.    + subtopic extraction
+  |         |
+  v         Match?
+  |       Y → topic found
+  |       N → D4 Curiosity Guide
+  v         |
+ [D3] Output Safety Check
+  |
+  v
+ [AI Tutor] — xAI Grok guided learning
+  |
+  v
+ Teaches subtopics one by one
+  |
+ Student says "new topic" → back to question
 ```
 
 ## What Each Layer Does
 
 - **D2** — Classifies your question: matches syllabus? repeated topic?
-- **D2.1** — If D2 says "no match": searches the web via xAI, extracts subtopics, vector-matches against central DB + memory DB. If match found → outputs result. If no match → redirects to D4.
-- **D4** — If D2.1 can't match: uses xAI Grok to detect curiosity patterns, validate novel ideas, classify queries (genuinely_novel vs off_topic), and guide the student with enrichment material.
-- **D1** — If D2 says "repeated + in syllabus": aggregates topic coverage, identifies gaps, generates reasoning packet.
-- **D3** — Output safety gate. Checks all pipeline output against policy.db (blocked patterns, content rules, length limits). Up to 2 retries on failure. If still unsafe → queues for mentor review, updates student's pending_reviews in central DB.
-- **Mentor Router** — Routes to relevant mentor(s) for the matched subject, calls mock_mentor.py (you answer yes/no).
+- **D2.1** — If D2 says "no match": searches the web via xAI, extracts subtopics, vector-matches against central DB + memory DB.
+- **D4** — If D2.1 can't match: detects curiosity patterns, classifies queries (genuinely_novel vs off_topic).
+- **D1** — If D2 says "repeated + in syllabus": aggregates topic coverage, identifies gaps.
+- **D3** — Output safety gate. Checks pipeline output against policy.db. Up to 2 retries. If still unsafe → queues for mentor review.
+- **AI Tutor** — xAI Grok-powered guided learning. Takes topic + subtopics from pipeline, teaches them one by one. Student stays in learning mode until they say "new topic".
 
 ---
 

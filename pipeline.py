@@ -1223,13 +1223,13 @@ class MentorRouter:
         if not mentors:
             return [{"error": f"No mentors found for subject '{subject_name}'"}]
 
-        responses = []
-        for m in mentors:
-            print(f"\n  >>> Routing to mentor: {m['mentor_name']} "
-                  f"(id={m['mentor_id']})")
-            resp = self.call_mentor(m["mentor_id"], question, topic_id)
-            responses.append(resp)
-        return responses
+        # pick one mentor per query (round-robin by question hash)
+        idx = hash(question) % len(mentors)
+        m = mentors[idx]
+        print(f"\n  >>> Routing to mentor: {m['mentor_name']} "
+              f"(id={m['mentor_id']})")
+        resp = self.call_mentor(m["mentor_id"], question, topic_id)
+        return [resp]
 
     # ---- store mentor responses to session memory ----
     def store_mentor_responses(self, student_id: int,
@@ -1500,7 +1500,107 @@ class D3OutputSafety:
 
 
 # =========================================================================
-# 6. Pipeline — orchestrates input → D2 → D2.1 → D4 / D1 → Mentor → output
+# 6. AI Tutor — xAI Grok-powered guided learning
+# =========================================================================
+class AITutor:
+    """Teaches subtopics one by one using xAI Grok.
+    Enters guided learning mode after pipeline identifies a topic."""
+
+    def __init__(self, central_conn: sqlite3.Connection):
+        self.central_conn = central_conn
+        if XAI_API_KEY and XAI_API_KEY != "your-xai-api-key-here":
+            self.client = OpenAI(
+                api_key=XAI_API_KEY,
+                base_url="https://api.x.ai/v1",
+            )
+        else:
+            self.client = None
+            print("[AITutor] WARNING: XAI_API_KEY not set — "
+                  "guided learning disabled.")
+
+    def get_subtopics(self, topic: str, pipeline_result: dict) -> list[str]:
+        """Extract ordered subtopics from pipeline result."""
+        d2 = pipeline_result.get("d2", {})
+        d2_1 = pipeline_result.get("d2_1")
+        d1 = pipeline_result.get("d1")
+
+        # syllabus match — get all chapter topics
+        if d2.get("syllabus_match") and d2.get("syllabus_topic_id"):
+            topic_id = d2["syllabus_topic_id"]
+            row = self.central_conn.execute(
+                """SELECT c.chapter_id FROM topics t
+                   JOIN chapters c ON t.chapter_id = c.chapter_id
+                   WHERE t.topic_id = ?""", (topic_id,)
+            ).fetchone()
+            if row:
+                topics = self.central_conn.execute(
+                    """SELECT topic_name FROM topics
+                       WHERE chapter_id = ?
+                       ORDER BY topic_id""", (row["chapter_id"],)
+                ).fetchall()
+                subs = [r["topic_name"] for r in topics]
+                if subs:
+                    return subs
+
+        # D2.1 match — use matched subtopics
+        if d2_1 and d2_1.get("status") == "syllabus_match":
+            if d2_1.get("subtopics"):
+                return [s.split(" > ")[-1] for s in d2_1["subtopics"]
+                        if " > " in s][:8]
+
+        # D4 — parse web results into subtopics
+        d4 = pipeline_result.get("d4")
+        if d4 and d4.get("result"):
+            lines = [l.strip().lstrip("- ").strip()
+                     for l in d4["result"].split("\n")
+                     if l.strip().startswith("- ")]
+            if lines:
+                return lines[:8]
+
+        # fallback — single topic
+        return [topic]
+
+    def teach_subtopic(self, topic: str, subtopic: str,
+                       history: list[dict]) -> str:
+        """Call xAI to explain one subtopic."""
+        if not self.client:
+            return (f"Let's learn about {subtopic}. "
+                    f"This is an important part of {topic}. "
+                    f"(AI tutor unavailable — add XAI_API_KEY to api.env)")
+
+        system = (
+            "You are a friendly, patient tutor helping a student learn. "
+            "Explain the subtopic clearly in 3-5 short paragraphs. "
+            "Use simple language, give one example, and end with a "
+            "brief summary. Be encouraging."
+        )
+        messages = [{"role": "system", "content": system}]
+        messages.extend(history[-6:])  # keep recent context
+        messages.append({
+            "role": "user",
+            "content": (
+                f"We're learning about {topic}. "
+                f"Now explain this subtopic: {subtopic}"
+            ),
+        })
+
+        try:
+            resp = self.client.chat.completions.create(
+                model=XAI_MODEL,
+                messages=messages,
+                temperature=0.7,
+                max_tokens=800,
+            )
+            return resp.choices[0].message.content.strip()
+        except Exception as e:
+            return f"Could not get explanation for {subtopic}: {e}"
+
+    def close(self):
+        pass
+
+
+# =========================================================================
+# 7. Pipeline — orchestrates input → D2 → D2.1 → D4 / D1 → D3 → output
 # =========================================================================
 class Pipeline:
     def __init__(self):
@@ -1512,6 +1612,7 @@ class Pipeline:
         self.router     = MentorRouter()
         self.d3         = D3OutputSafety(self.handler.central_conn,
                                          self.handler.session_conn)
+        self.tutor      = AITutor(self.handler.central_conn)
 
     # ---- display ----
     @staticmethod
@@ -1793,26 +1894,16 @@ class Pipeline:
             self.handler.store_d1_result(student_id, d1_result)
             self.show_d1_result(d1_result)
 
-        # 8. Mentor routing — activate when D2 matches a syllabus topic
+        # 8. Mentor routing — ONLY when D2 does NOT match syllabus
         mentor_responses = []
-        if d2_result["syllabus_match"]:
-            # extract subject name from matched syllabus path
-            subject = d2_result["syllabus_topic"].split(" > ")[0]
-            topic_id = d2_result["syllabus_topic_id"]
-
-            # build context-rich question for the mentor
-            mentor_q = question
-            if d1_result:
-                # include D1 context: what's been covered and what's missing
-                mentor_q += (f"\n[D1 Context: Parent topic={d1_result['detected_parent_topic']}, "
-                             f"Coverage={d1_result['coverage_pct']}%, "
-                             f"Missing={d1_result['missing_topics']}]")
-
-            mentor_responses = self.router.route_and_call(
-                subject, mentor_q, topic_id
-            )
-            self.router.store_mentor_responses(student_id, mentor_responses)
-            self.show_mentor_responses(subject, mentor_responses)
+        if not d2_result["syllabus_match"]:
+            if d2_1_result and d2_1_result.get("status") == "redirect_to_mentor":
+                closest_subject = d2_1_result.get("closest_subject", "Mathematics")
+                mentor_responses = self.router.route_and_call(
+                    closest_subject, question, None
+                )
+                self.router.store_mentor_responses(student_id, mentor_responses)
+                self.show_mentor_responses(closest_subject, mentor_responses)
 
         # 9. D3 — Output safety check
         output_text = self._build_output_text(
@@ -1861,35 +1952,33 @@ class Pipeline:
             d1_result = self.aggregator.aggregate(student_id, d2_result)
             self.handler.store_d1_result(student_id, d1_result)
 
-        mentor_responses = []
-        if d2_result["syllabus_match"]:
-            subject = d2_result["syllabus_topic"].split(" > ")[0]
-            topic_id = d2_result["syllabus_topic_id"]
-            mentor_q = question
-            if d1_result:
-                mentor_q += (f"\n[D1 Context: Parent={d1_result['detected_parent_topic']}, "
-                             f"Coverage={d1_result['coverage_pct']}%, "
-                             f"Missing={d1_result['missing_topics']}]")
-            mentor_responses = self.router.route_and_call(
-                subject, mentor_q, topic_id
-            )
-            self.router.store_mentor_responses(student_id, mentor_responses)
-
-        # 9. D3 — Output safety check
-        output_text = self._build_output_text(
-            d2_result, d2_1_result, d4_result, d1_result, mentor_responses
-        )
+        # 8. D3 — Output safety check
         partial = {"d2": d2_result, "d2_1": d2_1_result, "d4": d4_result,
-                   "d1": d1_result, "mentors": mentor_responses}
+                   "d1": d1_result, "mentors": []}
+        output_text = self._build_output_text(
+            d2_result, d2_1_result, d4_result, d1_result, []
+        )
         d3_result = self.d3.validate_with_retry(
             student_id, question, partial,
             lambda _attempt: (output_text, partial),
         )
 
+        # 9. Extract topic + subtopics for AI Tutor
+        topic = question
+        if d2_result.get("syllabus_topic"):
+            topic = d2_result["syllabus_topic"]
+        elif d2_1_result and d2_1_result.get("topic"):
+            topic = d2_1_result["topic"]
+        elif d4_result and d4_result.get("topic"):
+            topic = d4_result["topic"]
+
+        subtopics = self.tutor.get_subtopics(topic, partial)
+
         return {
             "intake": intake_info,
             "d2": d2_result, "d2_1": d2_1_result, "d4": d4_result,
-            "d1": d1_result, "mentors": mentor_responses, "d3": d3_result,
+            "d1": d1_result, "mentors": [], "d3": d3_result,
+            "topic": topic, "subtopics": subtopics,
         }
 
     # ---- CLI loop ----
@@ -1936,6 +2025,7 @@ class Pipeline:
         self.d4.close()
         self.router.close()
         self.d3.close()
+        self.tutor.close()
 
 
 # =========================================================================

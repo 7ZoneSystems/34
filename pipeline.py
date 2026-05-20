@@ -28,7 +28,7 @@ from datetime import datetime
 import numpy as np
 import requests
 from dotenv import load_dotenv
-from groq import Groq
+from openai import OpenAI
 from sentence_transformers import SentenceTransformer
 
 # ---------------------------------------------------------------------------
@@ -37,16 +37,21 @@ from sentence_transformers import SentenceTransformer
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 CENTRAL_DB  = os.path.join(BASE_DIR, "central.db")
 SESSION_DB  = os.path.join(BASE_DIR, "session_memory.db")
-MODEL_NAME  = "all-MiniLM-L6-v2"
+POLICY_DB   = os.path.join(BASE_DIR, "policy.db")
+MODEL_DIR   = os.path.join(BASE_DIR, "models", "all-MiniLM-L6-v2")
+
+# force offline — never hit HuggingFace Hub at runtime
+os.environ["HF_HUB_OFFLINE"] = "1"
+os.environ["TRANSFORMERS_OFFLINE"] = "1"
 
 # load API keys from api.env
 load_dotenv(os.path.join(BASE_DIR, "api.env"))
 
 # ---------------------------------------------------------------------------
-# D4 — Groq API key & mock web search data
+# xAI (Grok) API — single centralized key for all LLM calls
 # ---------------------------------------------------------------------------
-GROQ_API_KEY = os.getenv("GROQ_API_KEY", "")
-GROK_MODEL   = os.getenv("GROK_MODEL", "llama-3.3-70b-versatile")
+XAI_API_KEY = os.getenv("XAI_API_KEY", "")
+XAI_MODEL   = os.getenv("XAI_MODEL", "grok-3-mini")
 
 MOCK_WEB_RESULTS = """
 Quantum entanglement is a phenomenon in quantum physics where two or more
@@ -216,8 +221,8 @@ class D2Classifier:
     SIMILARITY_THRESHOLD = 0.65   # above = "matches"
 
     def __init__(self):
-        print(f"[D2] Loading embedding model '{MODEL_NAME}' ...")
-        self.model = SentenceTransformer(MODEL_NAME)
+        print("[D2] Loading embedding model (local) ...")
+        self.model = SentenceTransformer(MODEL_DIR)
         print("[D2] Model loaded.\n")
 
         self.central_conn = sqlite3.connect(CENTRAL_DB)
@@ -542,14 +547,18 @@ class D1Aggregator:
 
 
 # =========================================================================
-# 2.1  D2.1 — Novelty Handler (web search + syllabus re-match)
+# 2.1  D2.1 — Novelty Handler (xAI web search + syllabus re-match)
 # =========================================================================
 class D2_1NoveltyHandler:
     """Activates when D2 returns NO_MATCH_NEW or NO_MATCH_REPEAT.
-    Searches the web for the unmatched topic, extracts subtopics,
-    and vector-matches them against the Central DB syllabus.
-    If a match is found → returns structured output for the student.
-    If no match → calls reach_mentor_endpoint() → D4."""
+
+    Workflow:
+      1. xAI live web search → gather info about the novel topic
+      2. Extract subtopics from web results + memory DB context
+      3. Vector-match subtopics against Central DB syllabus
+      4. If match found → structured output for student
+      5. If no match → queue redirect to mentor (D4 handles it)
+    """
 
     SIMILARITY_THRESHOLD = 0.55
 
@@ -564,6 +573,18 @@ class D2_1NoveltyHandler:
         self._syllabus_ids: list[int] = []
         self._syllabus_embs: np.ndarray | None = None
 
+        # xAI client for live web search
+        if XAI_API_KEY and XAI_API_KEY != "your-xai-api-key-here":
+            self.xai_client = OpenAI(
+                api_key=XAI_API_KEY,
+                base_url="https://api.x.ai/v1",
+            )
+            print("[D2.1] xAI web search client initialized.")
+        else:
+            self.xai_client = None
+            print("[D2.1] WARNING: XAI_API_KEY not set — "
+                  "web search will use DuckDuckGo fallback.")
+
     # ---- encoding helpers ----
     @staticmethod
     def _cosine(a: np.ndarray, b: np.ndarray) -> np.ndarray:
@@ -571,52 +592,9 @@ class D2_1NoveltyHandler:
         b_n = b / (np.linalg.norm(b, axis=1, keepdims=True) + 1e-10)
         return np.dot(a_n, b_n.T)
 
-    # ---- web search ----
-    def web_search(self, query: str, max_results: int = 8) -> list[dict]:
-        """Search the web via DuckDuckGo Instant Answer API."""
-        try:
-            resp = requests.get(
-                "https://api.duckduckgo.com/",
-                params={"q": query, "format": "json", "no_html": 1, "skip_disambig": 1},
-                timeout=10,
-            )
-            resp.raise_for_status()
-            data = resp.json()
-        except (requests.RequestException, json.JSONDecodeError) as e:
-            print(f"[D2.1] Web search failed: {e}")
-            return []
-
-        results = []
-        if data.get("AbstractText"):
-            results.append({
-                "title": data.get("Heading", query),
-                "snippet": data["AbstractText"],
-                "source": data.get("AbstractSource", "DuckDuckGo"),
-            })
-        for item in data.get("RelatedTopics", [])[:max_results]:
-            if isinstance(item, dict) and "Text" in item:
-                results.append({
-                    "title": item.get("Text", "")[:100],
-                    "snippet": item.get("Text", ""),
-                    "source": item.get("FirstURL", "DuckDuckGo"),
-                })
-        return results
-
-    # ---- subtopic extraction ----
-    def extract_subtopics(self, search_results: list[dict]) -> list[str]:
-        """Parse web search results into a list of sub-topic strings."""
-        subtopics = []
-        for r in search_results:
-            text = r.get("title", "") + " " + r.get("snippet", "")
-            parts = re.split(r"[,;|\-\–\—]", text)
-            for part in parts:
-                clean = part.strip().strip(".")
-                if len(clean) > 5 and clean not in subtopics:
-                    subtopics.append(clean)
-        return subtopics[:20]
-
-    # ---- syllabus loader ----
+    # ---- context loaders ----
     def load_syllabus(self):
+        """Load all topics from central DB as syllabus."""
         rows = self.central_conn.execute(
             """SELECT t.topic_id,
                       s.subject_name || ' > ' || c.chapter_name || ' > ' || t.topic_name
@@ -632,14 +610,171 @@ class D2_1NoveltyHandler:
             self._syllabus_texts, convert_to_numpy=True, show_progress_bar=False
         )
 
+    def load_memory_context(self, student_id: int) -> list[str]:
+        """Load past student questions from session memory DB."""
+        rows = self.session_conn.execute(
+            """SELECT content FROM session_memory
+               WHERE session_id = ? AND role = 'student'
+               ORDER BY id""", (f"session_{student_id}",)
+        ).fetchall()
+        return [r["content"] for r in rows]
+
+    # ---- xAI live web search ----
+    def xai_web_search(self, query: str,
+                       memory_context: list[str] | None = None) -> tuple[str, list[dict]]:
+        """Use xAI live search to get web results for the query.
+        Enriches search with memory DB context.
+        Returns (full_response_text, citations_list)."""
+        if not self.xai_client:
+            # fallback to DuckDuckGo
+            results = self._ddg_fallback(query)
+            combined = " ".join(r["snippet"] for r in results)
+            return combined, results
+
+        # build context-aware search prompt
+        context_block = ""
+        if memory_context:
+            recent = memory_context[-5:]
+            context_block = (
+                "\n\nStudent's recent questions for context:\n"
+                + "\n".join(f"- {q}" for q in recent)
+            )
+
+        prompt = (
+            f"Research the topic: \"{query}\"{context_block}\n\n"
+            "Provide a comprehensive overview covering:\n"
+            "1. What this topic is about\n"
+            "2. Key subtopics and concepts\n"
+            "3. How it relates to mathematics, physics, or computer science\n"
+            "4. Important sub-areas a student should explore\n"
+            "List specific subtopics as a structured breakdown."
+        )
+
+        try:
+            resp = self.xai_client.chat.completions.create(
+                model=XAI_MODEL,
+                messages=[
+                    {"role": "system",
+                     "content": ("You are an educational research assistant. "
+                                 "Search the web and provide structured, "
+                                 "accurate information about academic topics.")},
+                    {"role": "user", "content": prompt},
+                ],
+                extra_body={
+                    "search_parameters": {
+                        "mode": "auto",
+                        "return_citations": True,
+                    },
+                },
+                temperature=0.3,
+                max_tokens=1500,
+            )
+            response_text = resp.choices[0].message.content.strip()
+
+            # extract citations from response
+            citations = []
+            if hasattr(resp, 'citations') and resp.citations:
+                for c in resp.citations:
+                    citations.append({
+                        "title": getattr(c, "title", ""),
+                        "snippet": getattr(c, "snippet", ""),
+                        "source": getattr(c, "url", ""),
+                    })
+
+            return response_text, citations
+
+        except Exception as e:
+            print(f"[D2.1] xAI search failed: {e}, falling back to DuckDuckGo")
+            results = self._ddg_fallback(query)
+            combined = " ".join(r["snippet"] for r in results)
+            return combined, results
+
+    def _ddg_fallback(self, query: str) -> list[dict]:
+        """DuckDuckGo fallback when xAI is unavailable."""
+        try:
+            resp = requests.get(
+                "https://api.duckduckgo.com/",
+                params={"q": query, "format": "json",
+                         "no_html": 1, "skip_disambig": 1},
+                timeout=10,
+            )
+            resp.raise_for_status()
+            data = resp.json()
+        except (requests.RequestException, json.JSONDecodeError) as e:
+            print(f"[D2.1] DuckDuckGo fallback failed: {e}")
+            return []
+
+        results = []
+        if data.get("AbstractText"):
+            results.append({
+                "title": data.get("Heading", query),
+                "snippet": data["AbstractText"],
+                "source": data.get("AbstractSource", "DuckDuckGo"),
+            })
+        for item in data.get("RelatedTopics", [])[:8]:
+            if isinstance(item, dict) and "Text" in item:
+                results.append({
+                    "title": item.get("Text", "")[:100],
+                    "snippet": item.get("Text", ""),
+                    "source": item.get("FirstURL", "DuckDuckGo"),
+                })
+        return results
+
+    # ---- subtopic extraction via xAI ----
+    def extract_subtopics_xai(self, query: str,
+                              web_response: str) -> list[str]:
+        """Use xAI to extract structured subtopics from web search results."""
+        if not self.xai_client:
+            return self._extract_subtopics_regex(web_response)
+
+        try:
+            resp = self.xai_client.chat.completions.create(
+                model=XAI_MODEL,
+                messages=[
+                    {"role": "system",
+                     "content": ("Extract a clean list of academic subtopics "
+                                 "from the given text. Return ONLY a JSON "
+                                 "array of strings, nothing else.")},
+                    {"role": "user",
+                     "content": (f"Topic: \"{query}\"\n\n"
+                                 f"Research text:\n{web_response[:3000]}\n\n"
+                                 "Extract the key subtopics as a JSON array "
+                                 "of short strings (2-5 words each).")},
+                ],
+                temperature=0.0,
+                max_tokens=500,
+            )
+            raw = resp.choices[0].message.content.strip()
+            # parse JSON array from response
+            json_match = re.search(r'\[.*\]', raw, re.DOTALL)
+            if json_match:
+                subtopics = json.loads(json_match.group())
+                return [s.strip() for s in subtopics if isinstance(s, str)][:20]
+        except Exception as e:
+            print(f"[D2.1] xAI subtopic extraction failed: {e}")
+
+        return self._extract_subtopics_regex(web_response)
+
+    @staticmethod
+    def _extract_subtopics_regex(text: str) -> list[str]:
+        """Fallback regex-based subtopic extraction."""
+        subtopics = []
+        parts = re.split(r"[,;|\-\–\—\n]", text)
+        for part in parts:
+            clean = part.strip().strip(".")
+            if 5 < len(clean) < 80 and clean not in subtopics:
+                subtopics.append(clean)
+        return subtopics[:20]
+
     # ---- syllabus matching ----
     def match_to_syllabus(self, topic: str, subtopics: list[str]) -> dict:
-        """Vector-match web-discovered subtopics against central syllabus."""
+        """Vector-match web-discovered subtopics against central DB syllabus."""
         if self._syllabus_embs is None:
             self.load_syllabus()
 
         candidates = [topic] + subtopics
-        c_embs = self.model.encode(candidates, convert_to_numpy=True, show_progress_bar=False)
+        c_embs = self.model.encode(candidates, convert_to_numpy=True,
+                                   show_progress_bar=False)
         sims = self._cosine(c_embs, self._syllabus_embs)
 
         best_score = 0.0
@@ -669,13 +804,44 @@ class D2_1NoveltyHandler:
             "ranked": ranked[:5],
         }
 
-    # ---- D4 redirect ----
-    def reach_mentor_endpoint(self, student_id: int, topic: str,
-                              d2_result: dict) -> dict:
-        """No syllabus match — route to mentor endpoint (D4)."""
+    # ---- memory-augmented matching ----
+    def match_with_memory(self, topic: str, subtopics: list[str],
+                          memory_context: list[str]) -> dict:
+        """Vector-match against syllabus AND memory DB past questions.
+        Returns combined match result."""
+        syllabus_match = self.match_to_syllabus(topic, subtopics)
+
+        # also check if any subtopics relate to past questions
+        memory_related = []
+        if memory_context:
+            m_embs = self.model.encode(memory_context, convert_to_numpy=True,
+                                       show_progress_bar=False)
+            s_embs = self.model.encode(subtopics[:10], convert_to_numpy=True,
+                                       show_progress_bar=False)
+            sims = self._cosine(s_embs, m_embs)
+
+            for si, sub in enumerate(subtopics[:10]):
+                best_mem_idx = int(np.argmax(sims[si]))
+                if sims[si][best_mem_idx] >= 0.5:
+                    memory_related.append({
+                        "subtopic": sub,
+                        "related_past_q": memory_context[best_mem_idx],
+                        "similarity": round(float(sims[si][best_mem_idx]), 4),
+                    })
+
+        syllabus_match["memory_related"] = memory_related
+        syllabus_match["memory_context_used"] = len(memory_context)
+        return syllabus_match
+
+    # ---- D4 redirect (queue request) ----
+    def queue_for_d4(self, student_id: int, topic: str,
+                     d2_result: dict, web_response: str,
+                     subtopics: list[str]) -> dict:
+        """No match found — queue redirect to D4 for mentor handling."""
         if self._syllabus_embs is None:
             self.load_syllabus()
 
+        # find closest subject for mentor routing
         t_emb = self.model.encode([topic], convert_to_numpy=True,
                                   show_progress_bar=False)
         sims = self._cosine(t_emb, self._syllabus_embs)[0]
@@ -691,10 +857,10 @@ class D2_1NoveltyHandler:
                WHERE s.subject_name = ?
                ORDER BY m.mentor_id""", (closest_subject,)
         ).fetchall()
-
         mentor_list = [{"id": m["mentor_id"], "name": m["mentor_name"]}
                        for m in mentors]
 
+        # store redirect in session memory (queued for D4)
         self.session_conn.execute(
             """INSERT INTO session_memory
                    (session_id, role, content, metadata)
@@ -703,10 +869,12 @@ class D2_1NoveltyHandler:
                 f"session_{student_id}",
                 topic,
                 json.dumps({
-                    "action": "redirect_to_mentor",
+                    "action": "redirect_to_d4",
                     "closest_subject": closest_subject,
                     "closest_topic": closest_path,
                     "mentors": mentor_list,
+                    "web_subtopics": subtopics[:10],
+                    "web_response_snippet": web_response[:500],
                     "original_d2": d2_result["classification"],
                 }),
             ),
@@ -716,34 +884,51 @@ class D2_1NoveltyHandler:
         return {
             "status": "redirect_to_mentor",
             "topic": topic,
-            "reason": "not_in_syllabus",
+            "reason": "subtopics_not_in_syllabus",
             "closest_subject": closest_subject,
             "closest_syllabus_topic": closest_path,
             "mentors_available": mentor_list,
+            "web_subtopics": subtopics[:10],
+            "web_response_snippet": web_response[:500],
         }
 
     # ---- main entry point ----
     def run_d2_1(self, student_id: int, input_topic: str,
                  d2_result: dict) -> dict:
-        """Full D2.1 pipeline: web search → extract → match → output or D4."""
+        """Full D2.1 pipeline:
+          1. xAI web search about novel topic
+          2. Extract subtopics
+          3. Match subtopics against central DB + memory DB
+          4. If match → output; if fail → queue redirect to D4
+        """
         print(f"\n[D2.1] Novelty handler activated for: \"{input_topic}\"")
 
-        # 1. web search
-        print("[D2.1] Searching the web ...")
-        search_results = self.web_search(input_topic)
-        print(f"[D2.1] Got {len(search_results)} search results.")
+        # 1. load context from memory DB
+        memory_context = self.load_memory_context(student_id)
+        print(f"[D2.1] Loaded {len(memory_context)} past questions from memory DB.")
 
-        # 2. extract subtopics
-        subtopics = self.extract_subtopics(search_results)
-        print(f"[D2.1] Extracted {len(subtopics)} candidate subtopics.")
+        # 2. xAI live web search
+        print("[D2.1] Searching the web via xAI ...")
+        web_response, citations = self.xai_web_search(input_topic,
+                                                       memory_context)
+        print(f"[D2.1] Got web response ({len(web_response)} chars, "
+              f"{len(citations)} citations).")
 
-        # 3. vector match against syllabus
-        print("[D2.1] Matching against Central DB syllabus ...")
-        match_result = self.match_to_syllabus(input_topic, subtopics)
-        print(f"[D2.1] Best similarity = {match_result['best_score']:.4f}  "
+        # 3. extract subtopics
+        print("[D2.1] Extracting subtopics ...")
+        subtopics = self.extract_subtopics_xai(input_topic, web_response)
+        print(f"[D2.1] Extracted {len(subtopics)} subtopics: "
+              f"{subtopics[:5]}{'...' if len(subtopics) > 5 else ''}")
+
+        # 4. vector match against central DB syllabus + memory DB
+        print("[D2.1] Matching subtopics against Central DB + Memory DB ...")
+        match_result = self.match_with_memory(input_topic, subtopics,
+                                               memory_context)
+        print(f"[D2.1] Best syllabus similarity = "
+              f"{match_result['best_score']:.4f} "
               f"(threshold={self.SIMILARITY_THRESHOLD})")
 
-        # 4. branch: syllabus match or redirect to mentor (D4)
+        # 5. branch: match found or redirect to D4
         if match_result["matched"]:
             best = match_result["ranked"][0]
             confirmed_topics = [
@@ -754,18 +939,22 @@ class D2_1NoveltyHandler:
                 "status": "syllabus_match",
                 "topic": best["syllabus_topic"],
                 "subtopics": confirmed_topics,
-                "source": "web_search",
-                "confirmed": True,
-                "match_score": best["score"],
                 "web_subtopics": subtopics,
+                "match_score": best["score"],
+                "citations": citations,
+                "memory_related": match_result.get("memory_related", []),
+                "web_response_snippet": web_response[:500],
                 "all_ranked": match_result["ranked"],
+                "source": "xai_web_search",
+                "confirmed": True,
             }
             print(f"[D2.1] MATCH FOUND -> {best['syllabus_topic']} "
                   f"(score={best['score']:.4f})")
         else:
-            output = self.reach_mentor_endpoint(student_id, input_topic,
-                                                d2_result)
-            print(f"[D2.1] No syllabus match -> redirecting to mentor endpoint (D4)")
+            # no match — queue for D4 (mentor redirect)
+            output = self.queue_for_d4(student_id, input_topic,
+                                        d2_result, web_response, subtopics)
+            print(f"[D2.1] No syllabus match -> queued for D4 mentor redirect")
 
         return output
 
@@ -784,12 +973,15 @@ class D4NoveltyRedirect:
 
     def __init__(self, session_conn: sqlite3.Connection):
         self.session_conn = session_conn
-        if not GROQ_API_KEY or GROQ_API_KEY == "your-groq-api-key-here":
-            print("[D4] WARNING: GROQ_API_KEY not set in api.env — "
-                  "D4 will use fallback logic (no LLM calls)")
-            self.groq_client = None
+        if XAI_API_KEY and XAI_API_KEY != "your-xai-api-key-here":
+            self.xai_client = OpenAI(
+                api_key=XAI_API_KEY,
+                base_url="https://api.x.ai/v1",
+            )
         else:
-            self.groq_client = Groq(api_key=GROQ_API_KEY)
+            self.xai_client = None
+            print("[D4] WARNING: XAI_API_KEY not set — "
+                  "D4 will use fallback logic (no LLM calls)")
         # tracks questions per student for curiosity pattern detection
         self._history: dict[int, list[str]] = {}
 
@@ -805,7 +997,7 @@ class D4NoveltyRedirect:
 
     def check_curiosity_pattern(self, student_id: int,
                                 current_question: str) -> bool:
-        """Use Groq to detect if the student is repeatedly exploring
+        """Use xAI to detect if the student is repeatedly exploring
         a new direction (curiosity pattern)."""
         self._load_recent_questions(student_id)
         past = self._history.get(student_id, [])
@@ -825,14 +1017,14 @@ class D4NoveltyRedirect:
             "Answer ONLY 'yes' or 'no'."
         )
 
-        if not self.groq_client:
+        if not self.xai_client:
             # fallback: detect curiosity by keyword overlap with past questions
             print("[D4] Using fallback curiosity detection (no API key)")
             return len(past) >= 3
 
         try:
-            resp = self.groq_client.chat.completions.create(
-                model=GROK_MODEL,
+            resp = self.xai_client.chat.completions.create(
+                model=XAI_MODEL,
                 messages=[{"role": "user", "content": prompt}],
                 temperature=0.0,
                 max_tokens=3,
@@ -840,13 +1032,13 @@ class D4NoveltyRedirect:
             answer = resp.choices[0].message.content.strip().lower()
             return answer.startswith("yes")
         except Exception as e:
-            print(f"[D4] Groq curiosity check failed: {e}")
+            print(f"[D4] xAI curiosity check failed: {e}")
             return False
 
     # ---- novel query classification ----
     def classify_novel_query(self, question: str,
                              d2_result: dict) -> str:
-        """Use Groq to classify the novel query as genuinely_novel
+        """Use xAI to classify the novel query as genuinely_novel
         or off_topic."""
         topic = d2_result.get("new_question", question)
         classification = d2_result.get("classification", "NO_MATCH_NEW")
@@ -864,14 +1056,14 @@ class D4NoveltyRedirect:
             "Answer ONLY with the tag: genuinely_novel or off_topic."
         )
 
-        if not self.groq_client:
+        if not self.xai_client:
             # fallback: assume genuinely novel
             print("[D4] Using fallback classification (no API key)")
             return "genuinely_novel"
 
         try:
-            resp = self.groq_client.chat.completions.create(
-                model=GROK_MODEL,
+            resp = self.xai_client.chat.completions.create(
+                model=XAI_MODEL,
                 messages=[{"role": "user", "content": prompt}],
                 temperature=0.0,
                 max_tokens=20,
@@ -881,7 +1073,7 @@ class D4NoveltyRedirect:
                 return "off_topic"
             return "genuinely_novel"
         except Exception as e:
-            print(f"[D4] Groq classification failed: {e}")
+            print(f"[D4] xAI classification failed: {e}")
             return "genuinely_novel"
 
     # ---- mock web search ----
@@ -1061,6 +1253,253 @@ class MentorRouter:
 
 
 # =========================================================================
+# 5. D3 — Output Safety & Policy Enforcement Layer
+# =========================================================================
+class D3OutputSafety:
+    """Checks pipeline output against policy.db before showing to student.
+    Up to 2 retries on failure, then queues for mentor review."""
+
+    def __init__(self, central_conn: sqlite3.Connection,
+                 session_conn: sqlite3.Connection):
+        self.central_conn = central_conn
+        self.session_conn = session_conn
+        self.policy_conn = sqlite3.connect(POLICY_DB)
+        self.policy_conn.row_factory = sqlite3.Row
+        self._load_config()
+
+    def _load_config(self):
+        rows = self.policy_conn.execute(
+            "SELECT config_key, config_value FROM safety_config"
+        ).fetchall()
+        self.config = {r["config_key"]: r["config_value"] for r in rows}
+        self.max_retries = int(self.config.get("max_retries", 2))
+        self.min_length = int(self.config.get("min_output_length", 10))
+        self.max_length = int(self.config.get("max_output_length", 5000))
+
+    def _get_blocked(self) -> list[dict]:
+        return self.policy_conn.execute(
+            "SELECT category, pattern, action FROM blocked_patterns"
+        ).fetchall()
+
+    def _get_rules(self) -> list[dict]:
+        return self.policy_conn.execute(
+            "SELECT rule_name, rule_type, pattern, severity FROM content_rules"
+        ).fetchall()
+
+    # ---- core check ----
+    def check_output(self, output_text: str, question: str,
+                     pipeline_result: dict) -> dict:
+        """Validate output_text against policy DB.
+        Returns {safe: bool, violations: [...], action: str}."""
+        text_lower = output_text.lower()
+        violations = []
+
+        # 1. length checks
+        if len(output_text.strip()) < self.min_length:
+            violations.append({
+                "rule": "min_length",
+                "detail": f"Output too short ({len(output_text)} < {self.min_length})",
+                "severity": 2,
+            })
+        if len(output_text) > self.max_length:
+            violations.append({
+                "rule": "max_length",
+                "detail": f"Output too long ({len(output_text)} > {self.max_length})",
+                "severity": 2,
+            })
+
+        # 2. blocked patterns
+        for bp in self._get_blocked():
+            if bp["pattern"] in text_lower:
+                violations.append({
+                    "rule": f"blocked:{bp['category']}",
+                    "detail": f"Blocked pattern found: '{bp['pattern']}'",
+                    "severity": 3 if bp["action"] == "block" else 2,
+                    "action": bp["action"],
+                })
+
+        # 3. content rules
+        for rule in self._get_rules():
+            if rule["rule_type"] == "block" and rule["pattern"] in text_lower:
+                violations.append({
+                    "rule": rule["rule_name"],
+                    "detail": f"Blocked by rule: {rule['pattern']}",
+                    "severity": rule["severity"],
+                    "action": "block",
+                })
+            elif rule["rule_type"] == "flag" and rule["pattern"] in text_lower:
+                violations.append({
+                    "rule": rule["rule_name"],
+                    "detail": f"Flagged by rule: {rule['pattern']}",
+                    "severity": rule["severity"],
+                    "action": "flag",
+                })
+
+        # 4. mentor response validation
+        mentors = pipeline_result.get("mentors", [])
+        for m in mentors:
+            if m.get("decision") == "no" and m.get("reasoning"):
+                reasoning_lower = m["reasoning"].lower()
+                for bp in self._get_blocked():
+                    if bp["pattern"] in reasoning_lower:
+                        violations.append({
+                            "rule": f"mentor_reasoning:{bp['category']}",
+                            "detail": (f"Mentor {m.get('mentor_name', '?')} "
+                                       f"reasoning contains: '{bp['pattern']}'"),
+                            "severity": 2,
+                        })
+
+        # 5. empty / error state check
+        if not output_text.strip() or output_text.strip() == "(no output)":
+            violations.append({
+                "rule": "empty_output",
+                "detail": "Pipeline produced no output",
+                "severity": 2,
+            })
+
+        # determine action
+        has_block = any(v.get("action") == "block" or v["severity"] >= 3
+                        for v in violations)
+        has_flag = any(v.get("action") == "flag" or v["severity"] == 2
+                       for v in violations)
+
+        if has_block:
+            action = "block"
+        elif has_flag:
+            action = "flag"
+        else:
+            action = "pass"
+
+        return {
+            "safe": action == "pass" and not violations,
+            "action": action,
+            "violations": violations,
+            "violation_count": len(violations),
+        }
+
+    # ---- retry loop ----
+    def validate_with_retry(self, student_id: int, question: str,
+                            pipeline_result: dict,
+                            generate_fn) -> dict:
+        """Run output through policy check with up to max_retries.
+        generate_fn() returns (output_text, result_dict).
+
+        Returns:
+          {status: 'approved'|'mentor_review',
+           output: str, check: dict, retry_count: int}
+        """
+        last_check = None
+        last_output = ""
+
+        for attempt in range(self.max_retries + 1):
+            output_text, result = generate_fn(attempt)
+            last_output = output_text
+
+            check = self.check_output(output_text, question, result)
+            last_check = check
+
+            if check["safe"]:
+                if attempt > 0:
+                    print(f"[D3] Output approved on retry #{attempt}.")
+                return {
+                    "status": "approved",
+                    "output": output_text,
+                    "check": check,
+                    "retry_count": attempt,
+                }
+
+            if check["action"] == "block":
+                print(f"[D3] BLOCKED (attempt {attempt + 1}): "
+                      f"{check['violations'][0]['detail']}")
+            else:
+                print(f"[D3] FLAGGED (attempt {attempt + 1}): "
+                      f"{check['violations'][0]['detail']}")
+
+        # all retries exhausted — queue for mentor review
+        print(f"[D3] Max retries ({self.max_retries}) exhausted. "
+              f"Queuing for mentor review.")
+        self._queue_mentor_review(student_id, question,
+                                  last_output, last_check)
+
+        return {
+            "status": "mentor_review",
+            "output": None,
+            "check": last_check,
+            "retry_count": self.max_retries,
+        }
+
+    # ---- mentor review queue ----
+    def _queue_mentor_review(self, student_id: int, question: str,
+                             failed_output: str, check: dict):
+        """Insert into mentor_reviews table and update student pending count."""
+        fail_reason = "; ".join(v["detail"] for v in check.get("violations", []))
+
+        # find best mentor for the student's question context
+        assigned = self._find_review_mentor(question)
+
+        self.central_conn.execute(
+            """INSERT INTO mentor_reviews
+                   (student_id, question, failed_output, fail_reason,
+                    retry_count, assigned_mentor_id, status, created_at)
+               VALUES (?, ?, ?, ?, ?, ?, 'pending', datetime('now'))""",
+            (student_id, question, failed_output, fail_reason,
+             self.max_retries, assigned),
+        )
+
+        # increment student's pending_reviews count
+        self.central_conn.execute(
+            """UPDATE students
+               SET pending_reviews = pending_reviews + 1,
+                   review_status = 'pending_review'
+               WHERE student_id = ?""",
+            (student_id,),
+        )
+        self.central_conn.commit()
+
+        # also log to session memory
+        self.session_conn.execute(
+            """INSERT INTO session_memory
+                   (session_id, role, content, metadata)
+               VALUES (?, 'd3_review', ?, ?)""",
+            (
+                f"session_{student_id}",
+                question,
+                json.dumps({
+                    "action": "queued_for_mentor_review",
+                    "fail_reason": fail_reason,
+                    "assigned_mentor_id": assigned,
+                    "retry_count": self.max_retries,
+                }),
+            ),
+        )
+        self.session_conn.commit()
+
+    def _find_review_mentor(self, question: str) -> int | None:
+        """Pick the most relevant mentor for review based on question."""
+        # use first available mentor as default for mock
+        row = self.central_conn.execute(
+            "SELECT mentor_id FROM mentors ORDER BY mentor_id LIMIT 1"
+        ).fetchone()
+        return row["mentor_id"] if row else None
+
+    def get_student_review_status(self, student_id: int) -> dict:
+        row = self.central_conn.execute(
+            """SELECT review_status, pending_reviews
+               FROM students WHERE student_id = ?""",
+            (student_id,),
+        ).fetchone()
+        if row:
+            return {
+                "review_status": row["review_status"],
+                "pending_reviews": row["pending_reviews"],
+            }
+        return {"review_status": "unknown", "pending_reviews": 0}
+
+    def close(self):
+        self.policy_conn.close()
+
+
+# =========================================================================
 # 6. Pipeline — orchestrates input → D2 → D2.1 → D4 / D1 → Mentor → output
 # =========================================================================
 class Pipeline:
@@ -1071,6 +1510,8 @@ class Pipeline:
         self.novelty    = D2_1NoveltyHandler(model=self.classifier.model)
         self.d4         = D4NoveltyRedirect(self.handler.session_conn)
         self.router     = MentorRouter()
+        self.d3         = D3OutputSafety(self.handler.central_conn,
+                                         self.handler.session_conn)
 
     # ---- display ----
     @staticmethod
@@ -1245,6 +1686,67 @@ class Pipeline:
         for line in result["result"].split("\n"):
             print(f"    {line}")
 
+    def show_d3_result(self, d3: dict):
+        self._banner("D3 OUTPUT SAFETY CHECK")
+        status = d3["status"]
+        check = d3.get("check", {})
+        self._section(f"Status: {status}  |  Retries: {d3.get('retry_count', 0)}")
+        if check.get("violations"):
+            print("  Violations:")
+            for v in check["violations"]:
+                print(f"    [{v.get('severity', '?')}] {v['detail']}")
+        else:
+            print("  No violations — output approved.")
+        if status == "mentor_review":
+            print()
+            print("  >>> Query queued for mentor review.")
+            print("  >>> Student will see: 'waiting for mentor review'.")
+
+    # ---- build output text for D3 checking ----
+    @staticmethod
+    def _build_output_text(d2: dict, d2_1: dict | None, d4: dict | None,
+                           d1: dict | None, mentors: list[dict]) -> str:
+        """Combine pipeline results into a single text block for D3 validation."""
+        parts = []
+
+        # classification
+        parts.append(f"Classification: {d2['classification']}")
+        if d2.get("syllabus_topic"):
+            parts.append(f"Topic: {d2['syllabus_topic']}")
+
+        # D2.1
+        if d2_1:
+            parts.append(f"D2.1 status: {d2_1.get('status', 'n/a')}")
+            if d2_1.get("topic"):
+                parts.append(f"D2.1 topic: {d2_1['topic']}")
+            if d2_1.get("web_response_snippet"):
+                parts.append(f"Web data: {d2_1['web_response_snippet'][:500]}")
+
+        # D4
+        if d4:
+            parts.append(f"D4 status: {d4.get('d4_status', 'n/a')}")
+            parts.append(f"D4 tag: {d4.get('classification_tag', 'n/a')}")
+            if d4.get("result"):
+                parts.append(f"D4 result: {d4['result'][:500]}")
+
+        # D1
+        if d1:
+            parts.append(f"D1 coverage: {d1.get('coverage_pct', 0)}%")
+
+        # mentors
+        for m in mentors:
+            if "error" in m:
+                parts.append(f"Mentor error: {m['error']}")
+            else:
+                parts.append(
+                    f"Mentor {m.get('mentor_name', '?')}: "
+                    f"{m.get('decision', '?')}"
+                )
+                if m.get("reasoning"):
+                    parts.append(f"  Reasoning: {m['reasoning']}")
+
+        return "\n".join(parts)
+
     # ---- run one question ----
     def run_question(self, student_id: int, date: str, question: str):
         # 1. load history BEFORE intake so D2 compares against
@@ -1312,8 +1814,83 @@ class Pipeline:
             self.router.store_mentor_responses(student_id, mentor_responses)
             self.show_mentor_responses(subject, mentor_responses)
 
-        return {"d2": d2_result, "d2_1": d2_1_result, "d4": d4_result,
-                "d1": d1_result, "mentors": mentor_responses}
+        # 9. D3 — Output safety check
+        output_text = self._build_output_text(
+            d2_result, d2_1_result, d4_result, d1_result, mentor_responses
+        )
+        partial = {"d2": d2_result, "d2_1": d2_1_result, "d4": d4_result,
+                   "d1": d1_result, "mentors": mentor_responses}
+        d3_result = self.d3.validate_with_retry(
+            student_id, question, partial,
+            lambda _attempt: (output_text, partial),
+        )
+        self.show_d3_result(d3_result)
+
+        partial["d3"] = d3_result
+        return partial
+
+    # ---- silent run (returns results without printing) ----
+    def run_question_silent(self, student_id: int, date: str,
+                            question: str) -> dict:
+        """Run the full pipeline without any display output.
+        Returns the same dict as run_question."""
+        self.classifier.load_context(student_id)
+        intake_info = self.handler.intake(student_id, date, question)
+        d2_result = self.classifier.classify(question)
+        self.handler.store_d2_result(student_id, d2_result)
+
+        d2_1_result = None
+        if d2_result["classification"] in ("NO_MATCH_NEW", "NO_MATCH_REPEAT"):
+            d2_1_result = self.novelty.run_d2_1(
+                student_id, question, d2_result
+            )
+            self.handler.store_d2_1_result(student_id, d2_1_result)
+
+        d4_result = None
+        if d2_1_result and d2_1_result.get("status") == "redirect_to_mentor":
+            d4_result = self.d4.run_d4(student_id, question, d2_result)
+            self.handler.store_d4_result(student_id, d4_result)
+
+        d1_result = None
+        if d2_result["classification"] == "MATCHES_SYLLABUS_REPEAT":
+            self.aggregator.set_syllabus(
+                self.classifier._syllabus_texts,
+                self.classifier._syllabus_ids,
+                self.classifier._syllabus_embs,
+            )
+            d1_result = self.aggregator.aggregate(student_id, d2_result)
+            self.handler.store_d1_result(student_id, d1_result)
+
+        mentor_responses = []
+        if d2_result["syllabus_match"]:
+            subject = d2_result["syllabus_topic"].split(" > ")[0]
+            topic_id = d2_result["syllabus_topic_id"]
+            mentor_q = question
+            if d1_result:
+                mentor_q += (f"\n[D1 Context: Parent={d1_result['detected_parent_topic']}, "
+                             f"Coverage={d1_result['coverage_pct']}%, "
+                             f"Missing={d1_result['missing_topics']}]")
+            mentor_responses = self.router.route_and_call(
+                subject, mentor_q, topic_id
+            )
+            self.router.store_mentor_responses(student_id, mentor_responses)
+
+        # 9. D3 — Output safety check
+        output_text = self._build_output_text(
+            d2_result, d2_1_result, d4_result, d1_result, mentor_responses
+        )
+        partial = {"d2": d2_result, "d2_1": d2_1_result, "d4": d4_result,
+                   "d1": d1_result, "mentors": mentor_responses}
+        d3_result = self.d3.validate_with_retry(
+            student_id, question, partial,
+            lambda _attempt: (output_text, partial),
+        )
+
+        return {
+            "intake": intake_info,
+            "d2": d2_result, "d2_1": d2_1_result, "d4": d4_result,
+            "d1": d1_result, "mentors": mentor_responses, "d3": d3_result,
+        }
 
     # ---- CLI loop ----
     def run(self):
@@ -1358,6 +1935,7 @@ class Pipeline:
         self.novelty.close()
         self.d4.close()
         self.router.close()
+        self.d3.close()
 
 
 # =========================================================================

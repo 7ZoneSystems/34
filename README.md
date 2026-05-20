@@ -2,31 +2,40 @@
 
 ## Setup
 
-1. Add your Groq API key to `api.env`:
+1. Add your xAI API key to `api.env`:
    ```
-   GROQ_API_KEY=gsk_your_actual_key_here
-   GROK_MODEL=llama-3.3-70b-versatile
+   XAI_API_KEY=xai-your_actual_key_here
+   XAI_MODEL=grok-3-mini
    ```
-   Without the key, D4 runs in fallback mode (no LLM calls — uses heuristics).
+   Without the key, D2.1 uses DuckDuckGo fallback and D4 uses heuristic fallback (no LLM calls).
 
-2. Install dependencies (already done if you followed setup):
+2. Install dependencies:
    ```bash
-   .env/bin/pip install sentence-transformers groq python-dotenv requests
+   .env/bin/pip install sentence-transformers openai python-dotenv requests
    ```
+
+3. Initialize the Policy DB (safety rules for D3):
+   ```bash
+   .env/bin/python setup_policy_db.py
+   ```
+
+---
 
 ## How to Run
 
+### Student Mode (clean interface)
+```bash
+.env/bin/python main.py
+```
+You act as a student. Pick your ID, ask questions, and see friendly responses.
+All internal pipeline logic runs silently in the background.
+Type `switch` to change student, `quit` to exit.
+
+### Debug Mode (full pipeline output)
 ```bash
 .env/bin/python pipeline.py
 ```
-
-You act as a **mock student**. The pipeline will:
-1. Show registered students
-2. Ask you for student_id, date, and a question
-3. Run D2 → D2.1 (if off-syllabus) → D4 (if novel redirect) → D1 (if repeated) → Mentor routing
-4. When mentors are called, you answer yes/no from the terminal
-
-Type `quit` to exit.
+Shows every pipeline layer's internal output (D2 classification, D2.1 matching, D4 analysis, D1 aggregation, mentor routing). Use this to test and debug the pipeline.
 
 ---
 
@@ -42,9 +51,154 @@ Type `quit` to exit.
 
 ---
 
-## Available Topics (27 total)
+## Test Prompts
 
-These are the topics in the syllabus. Ask questions about them and D2 will match them.
+Use these prompts to trigger each pipeline path. Run in debug mode (`pipeline.py`) to see the full internal flow, or student mode (`main.py`) to see the clean response.
+
+### Path 1: MATCHES_SYLLABUS_NEW
+First-time question about a syllabus topic. D2 matches → mentor routing.
+```
+How to solve linear equations?
+Explain the quadratic formula
+What is a for loop?
+How do convex lenses work?
+What is momentum?
+Explain Newton's laws of motion
+What is a linked list?
+How does quicksort work?
+What is binary search?
+```
+
+### Path 2: MATCHES_SYLLABUS_REPEAT
+Ask a similar question to one already asked. D2 matches + detects repeat → D1 aggregation → mentor routing with context.
+```
+# First:  "What are quadratic equations?"
+# Second: "How to solve quadratic equations again?"
+
+# First:  "Explain Newton's laws of motion"
+# Second: "Tell me more about inertia and Newton's first law"
+
+# First:  "What is a linked list?"
+# Second: "How to detect a cycle in a linked list?"
+```
+
+### Path 3: NO_MATCH_NEW → D2.1 syllabus re-match
+Off-syllabus question, but D2.1 finds a syllabus connection via web search + vector matching.
+```
+What is quantum entanglement?
+How does GPS work?
+What is the photoelectric effect?
+Explain the theory of relativity
+How do black holes form?
+```
+
+### Path 4: NO_MATCH_NEW → D2.1 → D4 (genuinely_novel)
+Off-syllabus question that doesn't match any syllabus topic. D4 classifies as genuinely novel → enrichment output.
+```
+What is machine learning?
+How does blockchain work?
+What is CRISPR gene editing?
+Explain the Turing test
+What is dark matter?
+```
+
+### Path 5: NO_MATCH_REPEAT → D2.1 → D4 (curiosity pattern)
+Ask multiple off-syllabus questions in sequence. After 3+ novel questions, D4 detects curiosity pattern → guide mode.
+```
+# Ask these in sequence (same session):
+What is machine learning?
+How do neural networks work?
+What is deep learning?
+# The third question should trigger D4 curiosity detection
+```
+
+### Path 6: Off-topic
+Casual or irrelevant questions. D4 classifies as off_topic → polite redirect.
+```
+What's the best pizza place?
+Tell me a joke
+What's the weather today?
+```
+
+### Path 7: D3 Safety — Blocked content
+Questions that trigger policy.db blocked patterns. D3 flags output → retries → queues for mentor review.
+To test: add a custom blocked pattern to policy.db, then ask a question whose pipeline output would contain it.
+```bash
+# Add a test blocked pattern:
+.env/bin/python -c "
+import sqlite3
+conn = sqlite3.connect('policy.db')
+conn.execute(\"INSERT INTO blocked_patterns (category, pattern, action) VALUES ('test', 'momentum', 'block')\")
+conn.commit(); conn.close()
+"
+# Now ask: "What is momentum?" — D3 will block the output containing "momentum"
+# After 2 retries → "Your query is waiting for mentor review"
+```
+
+---
+
+## Pipeline Flow
+
+```
+Student Question
+       |
+       v
+  [D2] Classifier
+  Is it in the syllabus? Is it a repeat?
+       |
+  +---------+---------+---------+
+  |         |         |         |
+YES+NEW   YES+REPEAT  NO+NEW   NO+REPEAT
+  |         |         |         |
+  v         v         v         v
+Mentor    [D1]      [D2.1]    [D2.1]
+Router    Aggreg.   WebSearch  WebSearch
+  |         |         |         |
+  v         v         v         v
+  |       Mentor    Match?    Match?
+  |       Router    Y->Mentor  Y->Mentor
+  |         |       N->D4      N->D4
+  v         v         v         v
+ [Session Memory DB — all results stored]
+                         |
+                         v
+                    [D4] Curiosity Guide
+                    (xAI Grok powered)
+                    - Curiosity pattern?
+                    - Novel query classification
+                    - Mock web search
+                    - Guide mode output
+                         |
+                         v
+              [D3] Output Safety Check
+              - Policy DB validation
+              - Blocked patterns
+              - Content rules
+              - Retry up to 2x
+              - Fail → mentor review
+                         |
+                    +----+----+
+                    |         |
+                  SAFE    UNSAFE (after 2 retries)
+                    |         |
+                    v         v
+                Student    "Your query is
+                sees       waiting for mentor
+                response   review"
+```
+
+## What Each Layer Does
+
+- **D2** — Classifies your question: matches syllabus? repeated topic?
+- **D2.1** — If D2 says "no match": searches the web via xAI, extracts subtopics, vector-matches against central DB + memory DB. If match found → outputs result. If no match → redirects to D4.
+- **D4** — If D2.1 can't match: uses xAI Grok to detect curiosity patterns, validate novel ideas, classify queries (genuinely_novel vs off_topic), and guide the student with enrichment material.
+- **D1** — If D2 says "repeated + in syllabus": aggregates topic coverage, identifies gaps, generates reasoning packet.
+- **D3** — Output safety gate. Checks all pipeline output against policy.db (blocked patterns, content rules, length limits). Up to 2 retries on failure. If still unsafe → queues for mentor review, updates student's pending_reviews in central DB.
+- **Mentor Router** — Routes to relevant mentor(s) for the matched subject, calls mock_mentor.py (you answer yes/no).
+
+---
+
+## Available Topics (27 total)
 
 ### Mathematics (9 topics)
 
@@ -126,75 +280,3 @@ These are the topics in the syllabus. Ask questions about them and D2 will match
 | 3  | Ms. Kavya Das | Computer Science | Full-stack developer and CS educator |
 | 4  | Mr. Rahul Menon | Mathematics | Mathematician with focus on geometry and number theory |
 | 5  | Dr. Sneha Kapoor | Physics, Computer Science | Interdisciplinary mentor covering physics and CS |
-
----
-
-## Pipeline Flow
-
-```
-Student Question
-       |
-       v
-  [D2] Classifier
-  Is it in the syllabus? Is it a repeat?
-       |
-  +---------+---------+---------+
-  |         |         |         |
-YES+NEW   YES+REPEAT  NO+NEW   NO+REPEAT
-  |         |         |         |
-  v         v         v         v
-Mentor    [D1]      [D2.1]    [D2.1]
-Router    Aggreg.   WebSearch  WebSearch
-  |         |         |         |
-  v         v         v         v
-  |       Mentor    Match?    Match?
-  |       Router    Y->Mentor  Y->Mentor
-  |         |       N->D4      N->D4
-  v         v         v         v
- [Session Memory DB — all results stored]
-                         |
-                         v
-                    [D4] Curiosity Guide
-                    (Groq LLM powered)
-                    - Curiosity pattern?
-                    - Novel query classification
-                    - Mock web search
-                    - Guide mode output
-```
-
-## What Each Layer Does
-
-- **D2** — Classifies your question: matches syllabus? repeated topic?
-- **D2.1** — If D2 says "no match": searches the web, tries to re-match to syllabus, or redirects to D4
-- **D4** — If D2.1 can't match: uses Groq LLM to detect curiosity patterns, validate novel ideas, classify queries (genuinely_novel vs off_topic), and guide the student with enrichment material
-- **D1** — If D2 says "repeated + in syllabus": aggregates topic coverage, identifies gaps, generates reasoning packet
-- **Mentor Router** — Routes to relevant mentor(s) for the matched subject, calls mock_mentor.py (you answer yes/no)
-
----
-
-## Questions That Trigger Each Path
-
-### MATCHES_SYLLABUS (D2 says yes, first time)
-Ask a question about any topic above for the first time.
-- Example: "How to solve linear equations?" → matches "Algebra > Linear Equations"
-- Pipeline: D2 -> Mentor Router (2 mentors called for Mathematics)
-
-### MATCHES_SYLLABUS_REPEAT (D2 says yes, repeated)
-Ask a similar question to one you already asked.
-- Example: First ask "What are quadratic equations?", then ask "How to solve quadratic equations again?"
-- Pipeline: D2 -> D1 (coverage analysis) -> Mentor Router (with D1 context)
-
-### NO_MATCH_NEW (D2 says no, brand new)
-Ask about something not in the syllabus at all.
-- Example: "What is quantum entanglement?"
-- Pipeline: D2 -> D2.1 (web search + syllabus re-match)
-- If D2.1 can't match: D2.1 -> D4 (curiosity detection, classification, guidance)
-  - D4 classifies as `genuinely_novel` -> mock web search + enrichment output
-  - D4 classifies as `off_topic` -> polite redirect to focus on syllabus
-
-### NO_MATCH_REPEAT (D2 says no, but similar to past)
-Ask about something off-syllabus that's similar to a previous off-syllabus question.
-- Pipeline: D2 -> D2.1 (web search + syllabus re-match)
-- If D2.1 can't match: D2.1 -> D4 (curiosity pattern detection)
-  - If 3+ past off-syllabus questions detected -> D4 enters Guide Mode
-  - Guide Mode: validates ideas, runs mock web search, returns enrichment material

@@ -5,6 +5,10 @@ __pycache__/
 *.pyd
 *.egg-info/
 
+# Local model weights and databases
+models/
+*.db
+
 # Virtual env
 env/
 venv/

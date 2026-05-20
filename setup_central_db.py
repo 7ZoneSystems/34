@@ -11,11 +11,13 @@ DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "central.db")
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS students (
-    student_id   INTEGER PRIMARY KEY AUTOINCREMENT,
-    name         TEXT NOT NULL,
-    email        TEXT,
-    grade        TEXT,
-    enrolled_at  TEXT DEFAULT (datetime('now'))
+    student_id      INTEGER PRIMARY KEY AUTOINCREMENT,
+    name            TEXT NOT NULL,
+    email           TEXT,
+    grade           TEXT,
+    enrolled_at     TEXT DEFAULT (datetime('now')),
+    review_status   TEXT DEFAULT 'active',
+    pending_reviews INTEGER DEFAULT 0
 );
 
 CREATE TABLE IF NOT EXISTS subjects (
@@ -49,6 +51,21 @@ CREATE TABLE IF NOT EXISTS mentor_subjects (
     PRIMARY KEY (mentor_id, subject_id),
     FOREIGN KEY (mentor_id)  REFERENCES mentors(mentor_id),
     FOREIGN KEY (subject_id) REFERENCES subjects(subject_id)
+);
+
+CREATE TABLE IF NOT EXISTS mentor_reviews (
+    review_id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    student_id         INTEGER NOT NULL,
+    question           TEXT NOT NULL,
+    failed_output      TEXT NOT NULL,
+    fail_reason        TEXT NOT NULL,
+    retry_count        INTEGER DEFAULT 0,
+    assigned_mentor_id INTEGER,
+    status             TEXT DEFAULT 'pending',
+    created_at         TEXT,
+    resolved_at        TEXT,
+    FOREIGN KEY (student_id)         REFERENCES students(student_id),
+    FOREIGN KEY (assigned_mentor_id) REFERENCES mentors(mentor_id)
 );
 """
 

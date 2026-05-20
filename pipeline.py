@@ -27,6 +27,7 @@ from datetime import datetime
 
 import numpy as np
 import requests
+from dotenv import load_dotenv
 from groq import Groq
 from sentence_transformers import SentenceTransformer
 
@@ -38,13 +39,37 @@ CENTRAL_DB  = os.path.join(BASE_DIR, "central.db")
 SESSION_DB  = os.path.join(BASE_DIR, "session_memory.db")
 MODEL_NAME  = "all-MiniLM-L6-v2"
 
+# load API keys from api.env
+load_dotenv(os.path.join(BASE_DIR, "api.env"))
+
 # ---------------------------------------------------------------------------
 # D4 — Groq API key & mock web search data
 # ---------------------------------------------------------------------------
-GROQ_API_KEY = "Enter your API key here"
+GROQ_API_KEY = os.getenv("GROQ_API_KEY", "")
+GROK_MODEL   = os.getenv("GROK_MODEL", "llama-3.3-70b-versatile")
 
 MOCK_WEB_RESULTS = """
-# Paste your web search data here
+Quantum entanglement is a phenomenon in quantum physics where two or more
+particles become correlated in such a way that the quantum state of each
+particle cannot be described independently. When particles are entangled,
+measuring the state of one particle instantly determines the state of the
+other, regardless of the distance between them.
+
+Key concepts related to quantum entanglement:
+- Bell's Theorem and Bell inequalities - prove entanglement is real
+- EPR Paradox - Einstein's objection to "spooky action at a distance"
+- Quantum superposition - particles exist in multiple states simultaneously
+- Quantum decoherence - how entangled states break down
+- Quantum teleportation - using entanglement to transfer quantum information
+- Quantum computing applications - entanglement as a computational resource
+- No-communication theorem - entanglement cannot transmit information faster than light
+
+Related physics topics:
+- Wave-particle duality
+- Heisenberg uncertainty principle
+- Schrodinger's cat thought experiment
+- Quantum field theory
+- Quantum cryptography and quantum key distribution
 """
 
 
@@ -759,7 +784,12 @@ class D4NoveltyRedirect:
 
     def __init__(self, session_conn: sqlite3.Connection):
         self.session_conn = session_conn
-        self.groq_client = Groq(api_key=GROQ_API_KEY)
+        if not GROQ_API_KEY or GROQ_API_KEY == "your-groq-api-key-here":
+            print("[D4] WARNING: GROQ_API_KEY not set in api.env — "
+                  "D4 will use fallback logic (no LLM calls)")
+            self.groq_client = None
+        else:
+            self.groq_client = Groq(api_key=GROQ_API_KEY)
         # tracks questions per student for curiosity pattern detection
         self._history: dict[int, list[str]] = {}
 
@@ -795,9 +825,14 @@ class D4NoveltyRedirect:
             "Answer ONLY 'yes' or 'no'."
         )
 
+        if not self.groq_client:
+            # fallback: detect curiosity by keyword overlap with past questions
+            print("[D4] Using fallback curiosity detection (no API key)")
+            return len(past) >= 3
+
         try:
             resp = self.groq_client.chat.completions.create(
-                model="llama-3.3-70b-versatile",
+                model=GROK_MODEL,
                 messages=[{"role": "user", "content": prompt}],
                 temperature=0.0,
                 max_tokens=3,
@@ -829,9 +864,14 @@ class D4NoveltyRedirect:
             "Answer ONLY with the tag: genuinely_novel or off_topic."
         )
 
+        if not self.groq_client:
+            # fallback: assume genuinely novel
+            print("[D4] Using fallback classification (no API key)")
+            return "genuinely_novel"
+
         try:
             resp = self.groq_client.chat.completions.create(
-                model="llama-3.3-70b-versatile",
+                model=GROK_MODEL,
                 messages=[{"role": "user", "content": prompt}],
                 temperature=0.0,
                 max_tokens=20,

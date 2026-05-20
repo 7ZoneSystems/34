@@ -1,5 +1,5 @@
 """
-Main Pipeline — Student Input → D2 → D1 → Mentor Router
+Main Pipeline — Student Input → D2 → D2.1 / D1 → Mentor Router
 
 Usage:
     python pipeline.py
@@ -7,19 +7,23 @@ Usage:
 Pipeline flow:
   1. StudentInputHandler  — validates student, stores question to session_memory.db
   2. D2Classifier         — classifies question (syllabus match? repeated topic?)
-  3. D1Aggregator         — (if repeated+syllabus) aggregates topic coverage + gaps
-  4. MentorRouter         — (if syllabus match) routes to relevant mentor(s) via
+  3. D2_1NoveltyHandler   — (if D2 says "No") web-searches topic, re-matches syllabus,
+                            or redirects to mentor endpoint (D4)
+  4. D1Aggregator         — (if repeated+syllabus) aggregates topic coverage + gaps
+  5. MentorRouter         — (if syllabus match) routes to relevant mentor(s) via
                             mock_mentor.py CLI, stores mentor responses
 """
 
 import json
 import os
+import re
 import sqlite3
 import subprocess
 import sys
 from datetime import datetime
 
 import numpy as np
+import requests
 from sentence_transformers import SentenceTransformer
 
 # ---------------------------------------------------------------------------
@@ -115,6 +119,19 @@ class StudentInputHandler:
             (
                 f"session_{student_id}",
                 analysis["new_question"],
+                json.dumps(analysis),
+            ),
+        )
+        self.session_conn.commit()
+
+    def store_d2_1_result(self, student_id: int, analysis: dict):
+        self.session_conn.execute(
+            """INSERT INTO session_memory
+                   (session_id, role, content, metadata)
+               VALUES (?, 'd2_1_analysis', ?, ?)""",
+            (
+                f"session_{student_id}",
+                analysis.get("topic", ""),
                 json.dumps(analysis),
             ),
         )
@@ -474,6 +491,239 @@ class D1Aggregator:
 
 
 # =========================================================================
+# 2.1  D2.1 — Novelty Handler (web search + syllabus re-match)
+# =========================================================================
+class D2_1NoveltyHandler:
+    """Activates when D2 returns NO_MATCH_NEW or NO_MATCH_REPEAT.
+    Searches the web for the unmatched topic, extracts subtopics,
+    and vector-matches them against the Central DB syllabus.
+    If a match is found → returns structured output for the student.
+    If no match → calls reach_mentor_endpoint() → D4."""
+
+    SIMILARITY_THRESHOLD = 0.55
+
+    def __init__(self, model):
+        self.model = model
+        self.central_conn = sqlite3.connect(CENTRAL_DB)
+        self.central_conn.row_factory = sqlite3.Row
+        self.session_conn = sqlite3.connect(SESSION_DB)
+        self.session_conn.row_factory = sqlite3.Row
+
+        self._syllabus_texts: list[str] = []
+        self._syllabus_ids: list[int] = []
+        self._syllabus_embs: np.ndarray | None = None
+
+    # ---- encoding helpers ----
+    @staticmethod
+    def _cosine(a: np.ndarray, b: np.ndarray) -> np.ndarray:
+        a_n = a / (np.linalg.norm(a, axis=1, keepdims=True) + 1e-10)
+        b_n = b / (np.linalg.norm(b, axis=1, keepdims=True) + 1e-10)
+        return np.dot(a_n, b_n.T)
+
+    # ---- web search ----
+    def web_search(self, query: str, max_results: int = 8) -> list[dict]:
+        """Search the web via DuckDuckGo Instant Answer API."""
+        try:
+            resp = requests.get(
+                "https://api.duckduckgo.com/",
+                params={"q": query, "format": "json", "no_html": 1, "skip_disambig": 1},
+                timeout=10,
+            )
+            resp.raise_for_status()
+            data = resp.json()
+        except (requests.RequestException, json.JSONDecodeError) as e:
+            print(f"[D2.1] Web search failed: {e}")
+            return []
+
+        results = []
+        if data.get("AbstractText"):
+            results.append({
+                "title": data.get("Heading", query),
+                "snippet": data["AbstractText"],
+                "source": data.get("AbstractSource", "DuckDuckGo"),
+            })
+        for item in data.get("RelatedTopics", [])[:max_results]:
+            if isinstance(item, dict) and "Text" in item:
+                results.append({
+                    "title": item.get("Text", "")[:100],
+                    "snippet": item.get("Text", ""),
+                    "source": item.get("FirstURL", "DuckDuckGo"),
+                })
+        return results
+
+    # ---- subtopic extraction ----
+    def extract_subtopics(self, search_results: list[dict]) -> list[str]:
+        """Parse web search results into a list of sub-topic strings."""
+        subtopics = []
+        for r in search_results:
+            text = r.get("title", "") + " " + r.get("snippet", "")
+            parts = re.split(r"[,;|\-\–\—]", text)
+            for part in parts:
+                clean = part.strip().strip(".")
+                if len(clean) > 5 and clean not in subtopics:
+                    subtopics.append(clean)
+        return subtopics[:20]
+
+    # ---- syllabus loader ----
+    def load_syllabus(self):
+        rows = self.central_conn.execute(
+            """SELECT t.topic_id,
+                      s.subject_name || ' > ' || c.chapter_name || ' > ' || t.topic_name
+                          AS full_path
+               FROM topics t
+               JOIN chapters c ON t.chapter_id = c.chapter_id
+               JOIN subjects s ON c.subject_id = s.subject_id
+               ORDER BY t.topic_id"""
+        ).fetchall()
+        self._syllabus_ids = [r["topic_id"] for r in rows]
+        self._syllabus_texts = [r["full_path"] for r in rows]
+        self._syllabus_embs = self.model.encode(
+            self._syllabus_texts, convert_to_numpy=True, show_progress_bar=False
+        )
+
+    # ---- syllabus matching ----
+    def match_to_syllabus(self, topic: str, subtopics: list[str]) -> dict:
+        """Vector-match web-discovered subtopics against central syllabus."""
+        if self._syllabus_embs is None:
+            self.load_syllabus()
+
+        candidates = [topic] + subtopics
+        c_embs = self.model.encode(candidates, convert_to_numpy=True, show_progress_bar=False)
+        sims = self._cosine(c_embs, self._syllabus_embs)
+
+        best_score = 0.0
+        best_syllabus_idx = 0
+        for ci in range(len(candidates)):
+            row_max_idx = int(np.argmax(sims[ci]))
+            row_max_score = float(sims[ci][row_max_idx])
+            if row_max_score > best_score:
+                best_score = row_max_score
+                best_syllabus_idx = row_max_idx
+
+        matched = best_score >= self.SIMILARITY_THRESHOLD
+
+        ranked = []
+        for si in range(len(self._syllabus_texts)):
+            score = float(np.max(sims[:, si]))
+            ranked.append({
+                "syllabus_topic": self._syllabus_texts[si],
+                "score": round(score, 4),
+            })
+        ranked.sort(key=lambda x: x["score"], reverse=True)
+
+        return {
+            "matched": matched,
+            "best_score": round(best_score, 4),
+            "best_syllabus_idx": best_syllabus_idx,
+            "ranked": ranked[:5],
+        }
+
+    # ---- D4 redirect ----
+    def reach_mentor_endpoint(self, student_id: int, topic: str,
+                              d2_result: dict) -> dict:
+        """No syllabus match — route to mentor endpoint (D4)."""
+        if self._syllabus_embs is None:
+            self.load_syllabus()
+
+        t_emb = self.model.encode([topic], convert_to_numpy=True,
+                                  show_progress_bar=False)
+        sims = self._cosine(t_emb, self._syllabus_embs)[0]
+        closest_idx = int(np.argmax(sims))
+        closest_path = self._syllabus_texts[closest_idx]
+        closest_subject = closest_path.split(" > ")[0]
+
+        mentors = self.central_conn.execute(
+            """SELECT DISTINCT m.mentor_id, m.mentor_name
+               FROM mentors m
+               JOIN mentor_subjects ms ON m.mentor_id = ms.mentor_id
+               JOIN subjects s ON ms.subject_id = s.subject_id
+               WHERE s.subject_name = ?
+               ORDER BY m.mentor_id""", (closest_subject,)
+        ).fetchall()
+
+        mentor_list = [{"id": m["mentor_id"], "name": m["mentor_name"]}
+                       for m in mentors]
+
+        self.session_conn.execute(
+            """INSERT INTO session_memory
+                   (session_id, role, content, metadata)
+               VALUES (?, 'd2_1_redirect', ?, ?)""",
+            (
+                f"session_{student_id}",
+                topic,
+                json.dumps({
+                    "action": "redirect_to_mentor",
+                    "closest_subject": closest_subject,
+                    "closest_topic": closest_path,
+                    "mentors": mentor_list,
+                    "original_d2": d2_result["classification"],
+                }),
+            ),
+        )
+        self.session_conn.commit()
+
+        return {
+            "status": "redirect_to_mentor",
+            "topic": topic,
+            "reason": "not_in_syllabus",
+            "closest_subject": closest_subject,
+            "closest_syllabus_topic": closest_path,
+            "mentors_available": mentor_list,
+        }
+
+    # ---- main entry point ----
+    def run_d2_1(self, student_id: int, input_topic: str,
+                 d2_result: dict) -> dict:
+        """Full D2.1 pipeline: web search → extract → match → output or D4."""
+        print(f"\n[D2.1] Novelty handler activated for: \"{input_topic}\"")
+
+        # 1. web search
+        print("[D2.1] Searching the web ...")
+        search_results = self.web_search(input_topic)
+        print(f"[D2.1] Got {len(search_results)} search results.")
+
+        # 2. extract subtopics
+        subtopics = self.extract_subtopics(search_results)
+        print(f"[D2.1] Extracted {len(subtopics)} candidate subtopics.")
+
+        # 3. vector match against syllabus
+        print("[D2.1] Matching against Central DB syllabus ...")
+        match_result = self.match_to_syllabus(input_topic, subtopics)
+        print(f"[D2.1] Best similarity = {match_result['best_score']:.4f}  "
+              f"(threshold={self.SIMILARITY_THRESHOLD})")
+
+        # 4. branch: syllabus match or redirect to mentor (D4)
+        if match_result["matched"]:
+            best = match_result["ranked"][0]
+            confirmed_topics = [
+                r["syllabus_topic"] for r in match_result["ranked"]
+                if r["score"] >= self.SIMILARITY_THRESHOLD
+            ]
+            output = {
+                "status": "syllabus_match",
+                "topic": best["syllabus_topic"],
+                "subtopics": confirmed_topics,
+                "source": "web_search",
+                "confirmed": True,
+                "match_score": best["score"],
+                "web_subtopics": subtopics,
+                "all_ranked": match_result["ranked"],
+            }
+            print(f"[D2.1] MATCH FOUND -> {best['syllabus_topic']} "
+                  f"(score={best['score']:.4f})")
+        else:
+            output = self.reach_mentor_endpoint(student_id, input_topic,
+                                                d2_result)
+            print(f"[D2.1] No syllabus match -> redirecting to mentor endpoint (D4)")
+
+        return output
+
+    def close(self):
+        self.central_conn.close()
+        self.session_conn.close()
+
+
+# =========================================================================
 # 4. Mentor Router — finds mentors for a subject & calls mock_mentor.py
 # =========================================================================
 class MentorRouter:
@@ -581,6 +831,7 @@ class Pipeline:
         self.handler    = StudentInputHandler()
         self.classifier = D2Classifier()
         self.aggregator = D1Aggregator(model=self.classifier.model)
+        self.novelty    = D2_1NoveltyHandler(model=self.classifier.model)
         self.router     = MentorRouter()
 
     # ---- display ----
@@ -673,18 +924,18 @@ class Pipeline:
         if d1["coverage"]:
             print("      Covered subtopics:")
             for s in d1["coverage"]:
-                print(f"        ✓ {s}")
+                print(f"        [+] {s}")
 
         if d1["missing_topics"]:
             print("      Missing subtopics:")
             for s in d1["missing_topics"]:
-                print(f"        ✗ {s}")
+                print(f"        [-] {s}")
 
         # ---- Related cross-subject ----
         if d1["related_topics"]:
             self._section("Related Cross-Subject Topics")
             for t in d1["related_topics"]:
-                print(f"      ↔ {t}")
+                print(f"      <-> {t}")
 
         # ---- Structured JSON ----
         self._section("Structured Reasoning Packet (JSON)")
@@ -712,6 +963,37 @@ class Pipeline:
                 print(f"  Reasoning: {r['reasoning']}")
             print()
 
+    def show_d2_1_result(self, result: dict):
+        self._banner("D2.1 NOVELTY HANDLER RESULT")
+
+        status = result["status"]
+        self._section(f"Status: {status}")
+
+        if status == "syllabus_match":
+            print(f"  Matched Topic : {result['topic']}")
+            print(f"  Match Score   : {result['match_score']:.4f}")
+            print(f"  Source        : {result['source']}")
+            print(f"  Confirmed     : {result['confirmed']}")
+            print()
+            print("  Syllabus subtopics matched:")
+            for t in result["subtopics"]:
+                print(f"    [+] {t}")
+            if result.get("web_subtopics"):
+                print()
+                print("  Web-discovered subtopics:")
+                for t in result["web_subtopics"][:8]:
+                    print(f"    -> {t}")
+
+        elif status == "redirect_to_mentor":
+            print(f"  Topic         : {result['topic']}")
+            print(f"  Reason        : {result['reason']}")
+            print(f"  Closest subj  : {result.get('closest_subject', '?')}")
+            print(f"  Closest topic : {result.get('closest_syllabus_topic', '?')}")
+            if result.get("mentors_available"):
+                print("  Available mentors:")
+                for m in result["mentors_available"]:
+                    print(f"    -> {m['name']} (id={m['id']})")
+
     # ---- run one question ----
     def run_question(self, student_id: int, date: str, question: str):
         # 1. load history BEFORE intake so D2 compares against
@@ -730,7 +1012,16 @@ class Pipeline:
         # 5. display D2
         self.show_result(intake_info, d2_result)
 
-        # 6. D1 — activate ONLY when D2 says repeated + in syllabus
+        # 6. D2.1 — activate when D2 says "No" (NO_MATCH_NEW / NO_MATCH_REPEAT)
+        d2_1_result = None
+        if d2_result["classification"] in ("NO_MATCH_NEW", "NO_MATCH_REPEAT"):
+            d2_1_result = self.novelty.run_d2_1(
+                student_id, question, d2_result
+            )
+            self.handler.store_d2_1_result(student_id, d2_1_result)
+            self.show_d2_1_result(d2_1_result)
+
+        # 7. D1 — activate ONLY when D2 says repeated + in syllabus
         d1_result = None
         if d2_result["classification"] == "MATCHES_SYLLABUS_REPEAT":
             self.aggregator.set_syllabus(
@@ -742,7 +1033,7 @@ class Pipeline:
             self.handler.store_d1_result(student_id, d1_result)
             self.show_d1_result(d1_result)
 
-        # 7. Mentor routing — activate when D2 matches a syllabus topic
+        # 8. Mentor routing — activate when D2 matches a syllabus topic
         mentor_responses = []
         if d2_result["syllabus_match"]:
             # extract subject name from matched syllabus path
@@ -763,7 +1054,7 @@ class Pipeline:
             self.router.store_mentor_responses(student_id, mentor_responses)
             self.show_mentor_responses(subject, mentor_responses)
 
-        return {"d2": d2_result, "d1": d1_result,
+        return {"d2": d2_result, "d2_1": d2_1_result, "d1": d1_result,
                 "mentors": mentor_responses}
 
     # ---- CLI loop ----
@@ -806,6 +1097,7 @@ class Pipeline:
         self.handler.close()
         self.classifier.close()
         self.aggregator.close()
+        self.novelty.close()
         self.router.close()
 
 

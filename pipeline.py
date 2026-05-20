@@ -1,25 +1,21 @@
 """
-Main Pipeline — Student Input + D2 Classification + D1 Aggregation
+Main Pipeline — Student Input → D2 → D1 → Mentor Router
 
 Usage:
     python pipeline.py
 
-D2 classifies each student question into:
-  - MATCHES_SYLLABUS      : topic is in the syllabus (first time asked)
-  - NO_MATCH_NEW          : topic is NOT in syllabus (first time asked)
-  - MATCHES_SYLLABUS_REPEAT : topic is in syllabus AND student asked it before
-  - NO_MATCH_REPEAT       : topic is NOT in syllabus AND student asked it before
-
-D1 activates ONLY when D2 returns MATCHES_SYLLABUS_REPEAT and:
-  - Scans session memory for all related past prompts
-  - Builds a topic aggregation (covered vs missing subtopics)
-  - Translates the raw prompt into structured intent
-  - Outputs a compact reasoning packet for downstream systems
+Pipeline flow:
+  1. StudentInputHandler  — validates student, stores question to session_memory.db
+  2. D2Classifier         — classifies question (syllabus match? repeated topic?)
+  3. D1Aggregator         — (if repeated+syllabus) aggregates topic coverage + gaps
+  4. MentorRouter         — (if syllabus match) routes to relevant mentor(s) via
+                            mock_mentor.py CLI, stores mentor responses
 """
 
 import json
 import os
 import sqlite3
+import subprocess
 import sys
 from datetime import datetime
 
@@ -478,13 +474,114 @@ class D1Aggregator:
 
 
 # =========================================================================
-# 4. Pipeline — orchestrates input → D2 → (D1) → output
+# 4. Mentor Router — finds mentors for a subject & calls mock_mentor.py
+# =========================================================================
+class MentorRouter:
+    """Given a subject from D2's matched topic, finds available mentors
+    in central.db and invokes mock_mentor.py for each one."""
+
+    MENTOR_SCRIPT = os.path.join(BASE_DIR, "mock_mentor.py")
+
+    def __init__(self):
+        self.central_conn = sqlite3.connect(CENTRAL_DB)
+        self.central_conn.row_factory = sqlite3.Row
+        self.session_conn = sqlite3.connect(SESSION_DB)
+        self.session_conn.row_factory = sqlite3.Row
+
+    # ---- lookup ----
+    def get_mentors_for_subject(self, subject_name: str) -> list[dict]:
+        rows = self.central_conn.execute(
+            """SELECT DISTINCT m.mentor_id, m.mentor_name, m.bio
+               FROM mentors m
+               JOIN mentor_subjects ms ON m.mentor_id = ms.mentor_id
+               JOIN subjects s ON ms.subject_id = s.subject_id
+               WHERE s.subject_name = ?
+               ORDER BY m.mentor_id""", (subject_name,)
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    def get_mentors_for_topic(self, topic_id: int) -> list[dict]:
+        rows = self.central_conn.execute(
+            """SELECT DISTINCT m.mentor_id, m.mentor_name, m.bio
+               FROM mentors m
+               JOIN mentor_subjects ms ON m.mentor_id = ms.mentor_id
+               JOIN chapters c ON c.subject_id = ms.subject_id
+               JOIN topics t ON t.chapter_id = c.chapter_id
+               WHERE t.topic_id = ?
+               ORDER BY m.mentor_id""", (topic_id,)
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    # ---- call a single mentor via mock_mentor.py ----
+    def call_mentor(self, mentor_id: int, question: str,
+                    topic_id: int | None = None) -> dict:
+        cmd = [sys.executable, self.MENTOR_SCRIPT,
+               "--mentor_id", str(mentor_id),
+               "--question", question]
+        if topic_id is not None:
+            cmd += ["--topic_id", str(topic_id)]
+
+        result = subprocess.run(cmd, capture_output=True, text=True)
+
+        # parse the JSON response from mock_mentor.py stdout
+        try:
+            json_start = result.stdout.rindex("--- RESPONSE (JSON) ---")
+            json_blob = result.stdout[json_start +
+                                      len("--- RESPONSE (JSON) ---"):].strip()
+            return json.loads(json_blob)
+        except (ValueError, json.JSONDecodeError):
+            return {
+                "mentor_id": mentor_id,
+                "error": "Could not parse mentor response",
+                "raw_stdout": result.stdout,
+                "raw_stderr": result.stderr,
+            }
+
+    # ---- call all mentors for a subject ----
+    def route_and_call(self, subject_name: str, question: str,
+                       topic_id: int | None = None) -> list[dict]:
+        mentors = self.get_mentors_for_subject(subject_name)
+        if not mentors:
+            return [{"error": f"No mentors found for subject '{subject_name}'"}]
+
+        responses = []
+        for m in mentors:
+            print(f"\n  >>> Routing to mentor: {m['mentor_name']} "
+                  f"(id={m['mentor_id']})")
+            resp = self.call_mentor(m["mentor_id"], question, topic_id)
+            responses.append(resp)
+        return responses
+
+    # ---- store mentor responses to session memory ----
+    def store_mentor_responses(self, student_id: int,
+                               responses: list[dict]):
+        for resp in responses:
+            self.session_conn.execute(
+                """INSERT INTO session_memory
+                       (session_id, role, content, metadata)
+                   VALUES (?, 'mentor_response', ?, ?)""",
+                (
+                    f"session_{student_id}",
+                    resp.get("question", ""),
+                    json.dumps(resp),
+                ),
+            )
+        self.session_conn.commit()
+
+    def close(self):
+        self.central_conn.close()
+        self.session_conn.close()
+
+
+# =========================================================================
+# 5. Pipeline — orchestrates input → D2 → (D1) → Mentor → output
 # =========================================================================
 class Pipeline:
     def __init__(self):
         self.handler    = StudentInputHandler()
         self.classifier = D2Classifier()
         self.aggregator = D1Aggregator(model=self.classifier.model)
+        self.router     = MentorRouter()
 
     # ---- display ----
     @staticmethod
@@ -602,6 +699,19 @@ class Pipeline:
         }
         print(json.dumps(packet, indent=6))
 
+    def show_mentor_responses(self, subject: str, responses: list[dict]):
+        self._banner(f"MENTOR RESPONSES ({subject})")
+        for r in responses:
+            if "error" in r:
+                print(f"  ERROR: {r['error']}")
+                continue
+            print(f"  Mentor   : {r.get('mentor_name', '?')} "
+                  f"(id={r.get('mentor_id', '?')})")
+            print(f"  Decision : {r.get('decision', '?').upper()}")
+            if r.get("reasoning"):
+                print(f"  Reasoning: {r['reasoning']}")
+            print()
+
     # ---- run one question ----
     def run_question(self, student_id: int, date: str, question: str):
         # 1. load history BEFORE intake so D2 compares against
@@ -623,7 +733,6 @@ class Pipeline:
         # 6. D1 — activate ONLY when D2 says repeated + in syllabus
         d1_result = None
         if d2_result["classification"] == "MATCHES_SYLLABUS_REPEAT":
-            # sync syllabus data to D1 (may have been reloaded)
             self.aggregator.set_syllabus(
                 self.classifier._syllabus_texts,
                 self.classifier._syllabus_ids,
@@ -633,7 +742,29 @@ class Pipeline:
             self.handler.store_d1_result(student_id, d1_result)
             self.show_d1_result(d1_result)
 
-        return {"d2": d2_result, "d1": d1_result}
+        # 7. Mentor routing — activate when D2 matches a syllabus topic
+        mentor_responses = []
+        if d2_result["syllabus_match"]:
+            # extract subject name from matched syllabus path
+            subject = d2_result["syllabus_topic"].split(" > ")[0]
+            topic_id = d2_result["syllabus_topic_id"]
+
+            # build context-rich question for the mentor
+            mentor_q = question
+            if d1_result:
+                # include D1 context: what's been covered and what's missing
+                mentor_q += (f"\n[D1 Context: Parent topic={d1_result['detected_parent_topic']}, "
+                             f"Coverage={d1_result['coverage_pct']}%, "
+                             f"Missing={d1_result['missing_topics']}]")
+
+            mentor_responses = self.router.route_and_call(
+                subject, mentor_q, topic_id
+            )
+            self.router.store_mentor_responses(student_id, mentor_responses)
+            self.show_mentor_responses(subject, mentor_responses)
+
+        return {"d2": d2_result, "d1": d1_result,
+                "mentors": mentor_responses}
 
     # ---- CLI loop ----
     def run(self):
@@ -675,6 +806,7 @@ class Pipeline:
         self.handler.close()
         self.classifier.close()
         self.aggregator.close()
+        self.router.close()
 
 
 # =========================================================================

@@ -1,5 +1,5 @@
 """
-Main Pipeline — Student Input → D2 → D2.1 / D1 → Mentor Router
+Main Pipeline — Student Input → D2 → D2.1 → D4 / D1 → Mentor Router
 
 Usage:
     python pipeline.py
@@ -8,9 +8,11 @@ Pipeline flow:
   1. StudentInputHandler  — validates student, stores question to session_memory.db
   2. D2Classifier         — classifies question (syllabus match? repeated topic?)
   3. D2_1NoveltyHandler   — (if D2 says "No") web-searches topic, re-matches syllabus,
-                            or redirects to mentor endpoint (D4)
-  4. D1Aggregator         — (if repeated+syllabus) aggregates topic coverage + gaps
-  5. MentorRouter         — (if syllabus match) routes to relevant mentor(s) via
+                            or redirects to D4
+  4. D4NoveltyRedirect    — (if D2.1 says redirect) curiosity detection, novel query
+                            classification, mock web search, guide mode
+  5. D1Aggregator         — (if repeated+syllabus) aggregates topic coverage + gaps
+  6. MentorRouter         — (if syllabus match) routes to relevant mentor(s) via
                             mock_mentor.py CLI, stores mentor responses
 """
 
@@ -20,10 +22,12 @@ import re
 import sqlite3
 import subprocess
 import sys
+import time
 from datetime import datetime
 
 import numpy as np
 import requests
+from groq import Groq
 from sentence_transformers import SentenceTransformer
 
 # ---------------------------------------------------------------------------
@@ -33,6 +37,15 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 CENTRAL_DB  = os.path.join(BASE_DIR, "central.db")
 SESSION_DB  = os.path.join(BASE_DIR, "session_memory.db")
 MODEL_NAME  = "all-MiniLM-L6-v2"
+
+# ---------------------------------------------------------------------------
+# D4 — Groq API key & mock web search data
+# ---------------------------------------------------------------------------
+GROQ_API_KEY = "Enter your API key here"
+
+MOCK_WEB_RESULTS = """
+# Paste your web search data here
+"""
 
 
 # =========================================================================
@@ -145,6 +158,19 @@ class StudentInputHandler:
             (
                 f"session_{student_id}",
                 analysis["triggered_by_question"],
+                json.dumps(analysis),
+            ),
+        )
+        self.session_conn.commit()
+
+    def store_d4_result(self, student_id: int, analysis: dict):
+        self.session_conn.execute(
+            """INSERT INTO session_memory
+                   (session_id, role, content, metadata)
+               VALUES (?, 'd4_analysis', ?, ?)""",
+            (
+                f"session_{student_id}",
+                analysis.get("topic", ""),
                 json.dumps(analysis),
             ),
         )
@@ -724,7 +750,178 @@ class D2_1NoveltyHandler:
 
 
 # =========================================================================
-# 4. Mentor Router — finds mentors for a subject & calls mock_mentor.py
+# 4. D4 — Novelty Redirection & Classification Layer
+# =========================================================================
+class D4NoveltyRedirect:
+    """Activates when D2.1 returns redirect_to_mentor.
+    Checks for curiosity pattern, classifies novel queries,
+    and triggers mock web search for genuinely novel topics."""
+
+    def __init__(self, session_conn: sqlite3.Connection):
+        self.session_conn = session_conn
+        self.groq_client = Groq(api_key=GROQ_API_KEY)
+        # tracks questions per student for curiosity pattern detection
+        self._history: dict[int, list[str]] = {}
+
+    # ---- curiosity pattern detection ----
+    def _load_recent_questions(self, student_id: int, limit: int = 10):
+        rows = self.session_conn.execute(
+            """SELECT content FROM session_memory
+               WHERE session_id = ? AND role = 'student'
+               ORDER BY id DESC LIMIT ?""",
+            (f"session_{student_id}", limit),
+        ).fetchall()
+        self._history[student_id] = [r["content"] for r in rows]
+
+    def check_curiosity_pattern(self, student_id: int,
+                                current_question: str) -> bool:
+        """Use Groq to detect if the student is repeatedly exploring
+        a new direction (curiosity pattern)."""
+        self._load_recent_questions(student_id)
+        past = self._history.get(student_id, [])
+
+        if len(past) < 3:
+            return False
+
+        past_block = "\n".join(f"- {q}" for q in past[:10])
+        prompt = (
+            "You are an educational AI analyzing a student's question history.\n"
+            "The student has been asking questions that fall outside the "
+            "standard syllabus.\n\n"
+            f"Recent questions:\n{past_block}\n\n"
+            f"Current question: \"{current_question}\"\n\n"
+            "Is the student repeatedly exploring a coherent new direction "
+            "or topic out of genuine curiosity? "
+            "Answer ONLY 'yes' or 'no'."
+        )
+
+        try:
+            resp = self.groq_client.chat.completions.create(
+                model="llama-3.3-70b-versatile",
+                messages=[{"role": "user", "content": prompt}],
+                temperature=0.0,
+                max_tokens=3,
+            )
+            answer = resp.choices[0].message.content.strip().lower()
+            return answer.startswith("yes")
+        except Exception as e:
+            print(f"[D4] Groq curiosity check failed: {e}")
+            return False
+
+    # ---- novel query classification ----
+    def classify_novel_query(self, question: str,
+                             d2_result: dict) -> str:
+        """Use Groq to classify the novel query as genuinely_novel
+        or off_topic."""
+        topic = d2_result.get("new_question", question)
+        classification = d2_result.get("classification", "NO_MATCH_NEW")
+
+        prompt = (
+            "You are an educational AI classifier.\n"
+            "A student asked a question that does not match the school "
+            "syllabus.\n\n"
+            f"Question: \"{question}\"\n"
+            f"D2 classification: {classification}\n\n"
+            "Classify this query:\n"
+            "- 'genuinely_novel' if it is a sincere academic or intellectual "
+            "question that could enrich the student's learning\n"
+            "- 'off_topic' if it is irrelevant, casual, or not constructive\n\n"
+            "Answer ONLY with the tag: genuinely_novel or off_topic."
+        )
+
+        try:
+            resp = self.groq_client.chat.completions.create(
+                model="llama-3.3-70b-versatile",
+                messages=[{"role": "user", "content": prompt}],
+                temperature=0.0,
+                max_tokens=20,
+            )
+            tag = resp.choices[0].message.content.strip().lower()
+            if "off_topic" in tag:
+                return "off_topic"
+            return "genuinely_novel"
+        except Exception as e:
+            print(f"[D4] Groq classification failed: {e}")
+            return "genuinely_novel"
+
+    # ---- mock web search ----
+    def web_search(self, query: str) -> str:
+        """Mock web search — prints loading message, waits, returns
+        MOCK_WEB_RESULTS."""
+        print("[D4] Searching the web...")
+        time.sleep(2)
+        print("[D4] Web search complete.")
+        return MOCK_WEB_RESULTS.strip()
+
+    # ---- guide mode ----
+    def enter_guide_mode(self, student_id: int,
+                         question: str) -> dict:
+        """Validate ideas and enter guide mode — triggers web search
+        and returns structured output."""
+        print("[D4] Curiosity pattern detected — entering Guide Mode")
+        print("[D4] Validating ideas and searching for enrichment material...")
+        search_data = self.web_search(question)
+
+        return {
+            "d4_status": "guide_mode",
+            "topic": question,
+            "classification_tag": "curiosity_pattern",
+            "result": (
+                "It looks like you're developing a genuine interest in this "
+                "area! Here's what I found to help you explore further:\n\n"
+                f"{search_data}"
+            ),
+        }
+
+    # ---- main entry point ----
+    def run_d4(self, student_id: int, question: str,
+               d2_result: dict) -> dict:
+        """Full D4 pipeline: curiosity check → classify → search/redirect."""
+        print(f"\n[D4] Novelty redirect activated for: \"{question}\"")
+
+        # 1. curiosity pattern check
+        is_curious = self.check_curiosity_pattern(student_id, question)
+
+        if is_curious:
+            # 2a. validate ideas → guide mode → web search
+            output = self.enter_guide_mode(student_id, question)
+        else:
+            # 2b. classify novel query
+            tag = self.classify_novel_query(question, d2_result)
+            print(f"[D4] Classification tag: {tag}")
+
+            if tag == "genuinely_novel":
+                # trigger web search
+                search_data = self.web_search(question)
+                output = {
+                    "d4_status": "novel_output",
+                    "topic": question,
+                    "classification_tag": "genuinely_novel",
+                    "result": search_data,
+                }
+            else:
+                # off_topic — polite redirect, stop
+                output = {
+                    "d4_status": "off_topic_redirect",
+                    "topic": question,
+                    "classification_tag": "off_topic",
+                    "result": (
+                        "That's an interesting question, but it seems to be "
+                        "outside the scope of your current studies. Let's "
+                        "focus on your syllabus topics for now — feel free "
+                        "to ask your mentor if you'd like to explore this "
+                        "further after your coursework!"
+                    ),
+                }
+
+        return output
+
+    def close(self):
+        pass
+
+
+# =========================================================================
+# 5. Mentor Router — finds mentors for a subject & calls mock_mentor.py
 # =========================================================================
 class MentorRouter:
     """Given a subject from D2's matched topic, finds available mentors
@@ -824,7 +1021,7 @@ class MentorRouter:
 
 
 # =========================================================================
-# 5. Pipeline — orchestrates input → D2 → (D1) → Mentor → output
+# 6. Pipeline — orchestrates input → D2 → D2.1 → D4 / D1 → Mentor → output
 # =========================================================================
 class Pipeline:
     def __init__(self):
@@ -832,6 +1029,7 @@ class Pipeline:
         self.classifier = D2Classifier()
         self.aggregator = D1Aggregator(model=self.classifier.model)
         self.novelty    = D2_1NoveltyHandler(model=self.classifier.model)
+        self.d4         = D4NoveltyRedirect(self.handler.session_conn)
         self.router     = MentorRouter()
 
     # ---- display ----
@@ -994,6 +1192,19 @@ class Pipeline:
                 for m in result["mentors_available"]:
                     print(f"    -> {m['name']} (id={m['id']})")
 
+    def show_d4_result(self, result: dict):
+        self._banner("D4 NOVELTY REDIRECT RESULT")
+
+        status = result["d4_status"]
+        tag = result["classification_tag"]
+        self._section(f"Status: {status}  |  Tag: {tag}")
+
+        print(f"  Topic : {result['topic']}")
+        print()
+        print("  Result:")
+        for line in result["result"].split("\n"):
+            print(f"    {line}")
+
     # ---- run one question ----
     def run_question(self, student_id: int, date: str, question: str):
         # 1. load history BEFORE intake so D2 compares against
@@ -1020,6 +1231,13 @@ class Pipeline:
             )
             self.handler.store_d2_1_result(student_id, d2_1_result)
             self.show_d2_1_result(d2_1_result)
+
+        # 6b. D4 — activate when D2.1 says redirect_to_mentor
+        d4_result = None
+        if d2_1_result and d2_1_result.get("status") == "redirect_to_mentor":
+            d4_result = self.d4.run_d4(student_id, question, d2_result)
+            self.handler.store_d4_result(student_id, d4_result)
+            self.show_d4_result(d4_result)
 
         # 7. D1 — activate ONLY when D2 says repeated + in syllabus
         d1_result = None
@@ -1054,8 +1272,8 @@ class Pipeline:
             self.router.store_mentor_responses(student_id, mentor_responses)
             self.show_mentor_responses(subject, mentor_responses)
 
-        return {"d2": d2_result, "d2_1": d2_1_result, "d1": d1_result,
-                "mentors": mentor_responses}
+        return {"d2": d2_result, "d2_1": d2_1_result, "d4": d4_result,
+                "d1": d1_result, "mentors": mentor_responses}
 
     # ---- CLI loop ----
     def run(self):
@@ -1098,6 +1316,7 @@ class Pipeline:
         self.classifier.close()
         self.aggregator.close()
         self.novelty.close()
+        self.d4.close()
         self.router.close()
 
 

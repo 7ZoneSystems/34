@@ -13,7 +13,7 @@ models/
 env/
 venv/
 .venv/
-
+api.env
 # System
 .DS_Store
 Thumbs.db

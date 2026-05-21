@@ -1,0 +1,454 @@
+{
+  "timestamp": "2026-05-21T07:22:23.454920",
+  "num_questions": 9,
+  "dimensions": [
+    "knowledge_depth",
+    "syllabus_alignment",
+    "subtopic_coverage",
+    "learning_progression",
+    "independent_thinking",
+    "curiosity_stimulation",
+    "system_integration",
+    "mentor_value"
+  ],
+  "time_pipeline_s": 160.7,
+  "time_grok_s": 23.1,
+  "time_judge_s": 12.9,
+  "summary": {
+    "pipeline_wins": 6,
+    "grok_wins": 3,
+    "ties": 0,
+    "avg_pipeline": 56.3,
+    "avg_grok": 41.9,
+    "category_averages": {
+      "structured_learning": {
+        "pipeline": 7.4,
+        "grok": 4.8
+      },
+      "balanced": {
+        "pipeline": 7.6,
+        "grok": 6.1
+      },
+      "independent_thinking": {
+        "pipeline": 5.8,
+        "grok": 5.2
+      }
+    }
+  },
+  "results": [
+    {
+      "id": 1,
+      "q": "How to solve a system of linear equations?",
+      "subject": "Mathematics",
+      "topic": "Mathematics > Algebra > Linear Equations",
+      "subtopics": [
+        "Linear Equations",
+        "Quadratic Equations",
+        "Polynomials"
+      ],
+      "scores": {
+        "A": {
+          "knowledge_depth": 3,
+          "syllabus_alignment": 3,
+          "subtopic_coverage": 5,
+          "learning_progression": 6,
+          "independent_thinking": 4,
+          "curiosity_stimulation": 6,
+          "system_integration": 8,
+          "mentor_value": 6
+        },
+        "B": {
+          "knowledge_depth": 9,
+          "syllabus_alignment": 3,
+          "subtopic_coverage": 8,
+          "learning_progression": 8,
+          "independent_thinking": 5,
+          "curiosity_stimulation": 4,
+          "system_integration": 2,
+          "mentor_value": 3
+        },
+        "A_total": 41,
+        "B_total": 42,
+        "winner": "B",
+        "reason": "B delivers accurate, on-topic depth with clear methods; A drifts off-topic into unrelated quadratics despite structure"
+      },
+      "winner": "B",
+      "reason": "B delivers accurate, on-topic depth with clear methods; A drifts off-topic into unrelated quadratics despite structure",
+      "pipeline_session": {
+        "num_subtopics": 3,
+        "num_followups": 2,
+        "syllabus_match": false,
+        "classification": "NO_MATCH_NEW",
+        "d4_triggered": false
+      }
+    },
+    {
+      "id": 2,
+      "q": "What is a limit in calculus and how do you evaluate it?",
+      "subject": "Mathematics",
+      "topic": "Mathematics > Calculus > Limits",
+      "subtopics": [
+        "Limits",
+        "Derivatives",
+        "Integrals"
+      ],
+      "scores": {
+        "A": {
+          "knowledge_depth": 7,
+          "syllabus_alignment": 9,
+          "subtopic_coverage": 8,
+          "learning_progression": 9,
+          "independent_thinking": 6,
+          "curiosity_stimulation": 7,
+          "system_integration": 9,
+          "mentor_value": 8
+        },
+        "B": {
+          "knowledge_depth": 9,
+          "syllabus_alignment": 5,
+          "subtopic_coverage": 4,
+          "learning_progression": 5,
+          "independent_thinking": 7,
+          "curiosity_stimulation": 6,
+          "system_integration": 3,
+          "mentor_value": 4
+        },
+        "A_total": 63,
+        "B_total": 43,
+        "winner": "A",
+        "reason": "A excels in structured progression and tutor-like guidance; B stronger on raw depth but lacks curriculum flow"
+      },
+      "winner": "A",
+      "reason": "A excels in structured progression and tutor-like guidance; B stronger on raw depth but lacks curriculum flow",
+      "pipeline_session": {
+        "num_subtopics": 3,
+        "num_followups": 2,
+        "syllabus_match": true,
+        "classification": "MATCHES_SYLLABUS",
+        "d4_triggered": false
+      }
+    },
+    {
+      "id": 3,
+      "q": "What are the types of triangles and how to prove congruence?",
+      "subject": "Mathematics",
+      "topic": "Mathematics > Geometry > Triangles",
+      "subtopics": [
+        "Triangles",
+        "Circles",
+        "Coordinate Geometry"
+      ],
+      "scores": {
+        "A": {
+          "knowledge_depth": 4,
+          "syllabus_alignment": 5,
+          "subtopic_coverage": 6,
+          "learning_progression": 5,
+          "independent_thinking": 3,
+          "curiosity_stimulation": 6,
+          "system_integration": 9,
+          "mentor_value": 7
+        },
+        "B": {
+          "knowledge_depth": 8,
+          "syllabus_alignment": 8,
+          "subtopic_coverage": 8,
+          "learning_progression": 7,
+          "independent_thinking": 4,
+          "curiosity_stimulation": 3,
+          "system_integration": 2,
+          "mentor_value": 3
+        },
+        "A_total": 45,
+        "B_total": 43,
+        "winner": "B",
+        "reason": "B fully answers both parts of query with accurate depth; A deviates to circles and omits congruence"
+      },
+      "winner": "B",
+      "reason": "B fully answers both parts of query with accurate depth; A deviates to circles and omits congruence",
+      "pipeline_session": {
+        "num_subtopics": 3,
+        "num_followups": 2,
+        "syllabus_match": false,
+        "classification": "NO_MATCH_NEW",
+        "d4_triggered": false
+      }
+    },
+    {
+      "id": 4,
+      "q": "Explain Newton's three laws of motion with examples",
+      "subject": "Physics",
+      "topic": "Physics > Mechanics > Newton's Laws",
+      "subtopics": [
+        "Newton's Laws",
+        "Work & Energy",
+        "Momentum"
+      ],
+      "scores": {
+        "A": {
+          "knowledge_depth": 8,
+          "syllabus_alignment": 9,
+          "subtopic_coverage": 9,
+          "learning_progression": 9,
+          "independent_thinking": 6,
+          "curiosity_stimulation": 8,
+          "system_integration": 9,
+          "mentor_value": 9
+        },
+        "B": {
+          "knowledge_depth": 9,
+          "syllabus_alignment": 6,
+          "subtopic_coverage": 5,
+          "learning_progression": 5,
+          "independent_thinking": 7,
+          "curiosity_stimulation": 7,
+          "system_integration": 3,
+          "mentor_value": 4
+        },
+        "A_total": 67,
+        "B_total": 46,
+        "winner": "A",
+        "reason": "A excels in structured guidance and progression; B stronger on precise depth but weaker on curriculum integration"
+      },
+      "winner": "A",
+      "reason": "A excels in structured guidance and progression; B stronger on precise depth but weaker on curriculum integration",
+      "pipeline_session": {
+        "num_subtopics": 3,
+        "num_followups": 2,
+        "syllabus_match": true,
+        "classification": "MATCHES_SYLLABUS",
+        "d4_triggered": false
+      }
+    },
+    {
+      "id": 5,
+      "q": "What are the three modes of heat transfer?",
+      "subject": "Physics",
+      "topic": "Physics > Thermodynamics > Heat Transfer",
+      "subtopics": [
+        "Heat Transfer",
+        "Laws of Thermodynamics",
+        "Entropy"
+      ],
+      "scores": {
+        "A": {
+          "knowledge_depth": 7,
+          "syllabus_alignment": 9,
+          "subtopic_coverage": 8,
+          "learning_progression": 8,
+          "independent_thinking": 6,
+          "curiosity_stimulation": 8,
+          "system_integration": 9,
+          "mentor_value": 8
+        },
+        "B": {
+          "knowledge_depth": 9,
+          "syllabus_alignment": 4,
+          "subtopic_coverage": 6,
+          "learning_progression": 7,
+          "independent_thinking": 3,
+          "curiosity_stimulation": 4,
+          "system_integration": 2,
+          "mentor_value": 5
+        },
+        "A_total": 63,
+        "B_total": 40,
+        "winner": "A",
+        "reason": "A excels in structured guidance, syllabus fit, and progression; B leads only in raw technical depth"
+      },
+      "winner": "A",
+      "reason": "A excels in structured guidance, syllabus fit, and progression; B leads only in raw technical depth",
+      "pipeline_session": {
+        "num_subtopics": 3,
+        "num_followups": 2,
+        "syllabus_match": true,
+        "classification": "MATCHES_SYLLABUS",
+        "d4_triggered": false
+      }
+    },
+    {
+      "id": 6,
+      "q": "What is refraction and explain Snell's law",
+      "subject": "Physics",
+      "topic": "Physics > Optics > Refraction",
+      "subtopics": [
+        "Reflection",
+        "Refraction",
+        "Lenses"
+      ],
+      "scores": {
+        "A": {
+          "knowledge_depth": 7,
+          "syllabus_alignment": 9,
+          "subtopic_coverage": 8,
+          "learning_progression": 9,
+          "independent_thinking": 6,
+          "curiosity_stimulation": 7,
+          "system_integration": 9,
+          "mentor_value": 8
+        },
+        "B": {
+          "knowledge_depth": 9,
+          "syllabus_alignment": 5,
+          "subtopic_coverage": 4,
+          "learning_progression": 6,
+          "independent_thinking": 7,
+          "curiosity_stimulation": 8,
+          "system_integration": 3,
+          "mentor_value": 4
+        },
+        "A_total": 63,
+        "B_total": 46,
+        "winner": "A",
+        "reason": "A excels in structured guidance, progression and integration while B leads in raw depth and direct explanation"
+      },
+      "winner": "A",
+      "reason": "A excels in structured guidance, progression and integration while B leads in raw depth and direct explanation",
+      "pipeline_session": {
+        "num_subtopics": 3,
+        "num_followups": 2,
+        "syllabus_match": true,
+        "classification": "MATCHES_SYLLABUS",
+        "d4_triggered": false
+      }
+    },
+    {
+      "id": 7,
+      "q": "What is a function and how to write a recursive function?",
+      "subject": "Computer Science",
+      "topic": "Computer Science > Programming Fundamentals > Functions",
+      "subtopics": [
+        "Variables & Data Types",
+        "Control Flow",
+        "Functions"
+      ],
+      "scores": {
+        "A": {
+          "knowledge_depth": 5,
+          "syllabus_alignment": 7,
+          "subtopic_coverage": 8,
+          "learning_progression": 8,
+          "independent_thinking": 4,
+          "curiosity_stimulation": 5,
+          "system_integration": 9,
+          "mentor_value": 8
+        },
+        "B": {
+          "knowledge_depth": 9,
+          "syllabus_alignment": 3,
+          "subtopic_coverage": 6,
+          "learning_progression": 7,
+          "independent_thinking": 7,
+          "curiosity_stimulation": 8,
+          "system_integration": 2,
+          "mentor_value": 4
+        },
+        "A_total": 54,
+        "B_total": 46,
+        "winner": "B",
+        "reason": "B delivers accurate, complete coverage of functions + recursion with clear progression and examples; A is structured but off-topic and omits recursion entirely"
+      },
+      "winner": "B",
+      "reason": "B delivers accurate, complete coverage of functions + recursion with clear progression and examples; A is structured but off-topic and omits recursion entirely",
+      "pipeline_session": {
+        "num_subtopics": 3,
+        "num_followups": 2,
+        "syllabus_match": false,
+        "classification": "NO_MATCH_NEW",
+        "d4_triggered": false
+      }
+    },
+    {
+      "id": 8,
+      "q": "What is a linked list and how to detect a cycle in it?",
+      "subject": "Computer Science",
+      "topic": "Computer Science > Data Structures > Linked Lists",
+      "subtopics": [
+        "Arrays",
+        "Linked Lists",
+        "Trees & Graphs"
+      ],
+      "scores": {
+        "A": {
+          "knowledge_depth": 4,
+          "syllabus_alignment": 8,
+          "subtopic_coverage": 7,
+          "learning_progression": 8,
+          "independent_thinking": 5,
+          "curiosity_stimulation": 6,
+          "system_integration": 9,
+          "mentor_value": 8
+        },
+        "B": {
+          "knowledge_depth": 9,
+          "syllabus_alignment": 3,
+          "subtopic_coverage": 6,
+          "learning_progression": 5,
+          "independent_thinking": 3,
+          "curiosity_stimulation": 4,
+          "system_integration": 2,
+          "mentor_value": 4
+        },
+        "A_total": 55,
+        "B_total": 36,
+        "winner": "A",
+        "reason": "A excels in structured guidance and progression; B stronger on direct topic depth but lacks curriculum framing"
+      },
+      "winner": "A",
+      "reason": "A excels in structured guidance and progression; B stronger on direct topic depth but lacks curriculum framing",
+      "pipeline_session": {
+        "num_subtopics": 3,
+        "num_followups": 2,
+        "syllabus_match": false,
+        "classification": "NO_MATCH_NEW",
+        "d4_triggered": false
+      }
+    },
+    {
+      "id": 9,
+      "q": "How does quicksort work and what is its time complexity?",
+      "subject": "Computer Science",
+      "topic": "Computer Science > Algorithms > Sorting",
+      "subtopics": [
+        "Sorting",
+        "Searching",
+        "Dynamic Programming"
+      ],
+      "scores": {
+        "A": {
+          "knowledge_depth": 5,
+          "syllabus_alignment": 7,
+          "subtopic_coverage": 8,
+          "learning_progression": 8,
+          "independent_thinking": 4,
+          "curiosity_stimulation": 7,
+          "system_integration": 9,
+          "mentor_value": 8
+        },
+        "B": {
+          "knowledge_depth": 9,
+          "syllabus_alignment": 2,
+          "subtopic_coverage": 5,
+          "learning_progression": 7,
+          "independent_thinking": 3,
+          "curiosity_stimulation": 4,
+          "system_integration": 2,
+          "mentor_value": 3
+        },
+        "A_total": 56,
+        "B_total": 35,
+        "winner": "A",
+        "reason": "A excels on structured dimensions and guided progression despite shallower quicksort coverage; B wins depth but lacks tutoring integration"
+      },
+      "winner": "A",
+      "reason": "A excels on structured dimensions and guided progression despite shallower quicksort coverage; B wins depth but lacks tutoring integration",
+      "pipeline_session": {
+        "num_subtopics": 3,
+        "num_followups": 2,
+        "syllabus_match": false,
+        "classification": "NO_MATCH_NEW",
+        "d4_triggered": false
+      }
+    }
+  ]
+}

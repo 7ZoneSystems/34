@@ -1550,9 +1550,8 @@ class AITutor:
         d2_1 = pipeline_result.get("d2_1")
         d1 = pipeline_result.get("d1")
 
-        # syllabus match — get all chapter topics
-        if d2.get("syllabus_match") and d2.get("syllabus_topic_id"):
-            topic_id = d2["syllabus_topic_id"]
+        # Helper: get all chapter topics for a given topic_id
+        def _chapter_topics(topic_id):
             row = self.central_conn.execute(
                 """SELECT c.chapter_id FROM topics t
                    JOIN chapters c ON t.chapter_id = c.chapter_id
@@ -1564,12 +1563,29 @@ class AITutor:
                        WHERE chapter_id = ?
                        ORDER BY topic_id""", (row["chapter_id"],)
                 ).fetchall()
-                subs = [r["topic_name"] for r in topics]
+                return [r["topic_name"] for r in topics]
+            return []
+
+        # syllabus match — get all chapter topics
+        if d2.get("syllabus_match") and d2.get("syllabus_topic_id"):
+            subs = _chapter_topics(d2["syllabus_topic_id"])
+            if subs:
+                return subs
+
+        # D2.1 match — find topic_id from matched path, get chapter topics
+        if d2_1 and d2_1.get("status") == "syllabus_match":
+            matched_topic = d2_1.get("topic", "")
+            # try to find the topic_id from the matched path
+            topic_name = matched_topic.split(" > ")[-1] if " > " in matched_topic else matched_topic
+            row = self.central_conn.execute(
+                """SELECT topic_id FROM topics WHERE topic_name = ?""",
+                (topic_name,)
+            ).fetchone()
+            if row:
+                subs = _chapter_topics(row["topic_id"])
                 if subs:
                     return subs
-
-        # D2.1 match — use matched subtopics
-        if d2_1 and d2_1.get("status") == "syllabus_match":
+            # fallback: use D2.1 subtopics
             if d2_1.get("subtopics"):
                 return [s.split(" > ")[-1] for s in d2_1["subtopics"]
                         if " > " in s][:8]

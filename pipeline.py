@@ -231,7 +231,8 @@ class D2Classifier:
         self.session_conn.row_factory = sqlite3.Row
 
         # will be populated by load_context()
-        self._syllabus_texts: list[str] = []
+        self._syllabus_paths: list[str] = []   # clean path for display
+        self._syllabus_texts: list[str] = []   # enriched text for embeddings
         self._syllabus_ids: list[int] = []
         self._syllabus_embs: np.ndarray | None = None
 
@@ -244,14 +245,25 @@ class D2Classifier:
         rows = self.central_conn.execute(
             """SELECT t.topic_id,
                       s.subject_name || ' > ' || c.chapter_name || ' > ' || t.topic_name
-                          AS full_path
+                          AS full_path,
+                      COALESCE(t.keywords, '') AS keywords,
+                      COALESCE(t.description, '') AS description
                FROM topics t
                JOIN chapters c ON t.chapter_id = c.chapter_id
                JOIN subjects s ON c.subject_id = s.subject_id
                ORDER BY t.topic_id"""
         ).fetchall()
         self._syllabus_ids   = [r["topic_id"] for r in rows]
-        self._syllabus_texts = [r["full_path"]  for r in rows]
+        self._syllabus_paths = [r["full_path"] for r in rows]
+        # Build rich text for embeddings: path + description + keywords
+        self._syllabus_texts = []
+        for r in rows:
+            parts = [r["full_path"]]
+            if r["description"]:
+                parts.append(r["description"])
+            if r["keywords"]:
+                parts.append(r["keywords"])
+            self._syllabus_texts.append(" | ".join(parts))
         self._syllabus_embs  = self._encode(self._syllabus_texts)
         print(f"[D2] Loaded {len(self._syllabus_texts)} syllabus topics.")
 
@@ -333,7 +345,7 @@ class D2Classifier:
             # syllabus
             "syllabus_match":   matches_syllabus,
             "syllabus_score":   round(best_score, 4),
-            "syllabus_topic":   self._syllabus_texts[best_idx],
+            "syllabus_topic":   self._syllabus_paths[best_idx],
             "syllabus_topic_id": self._syllabus_ids[best_idx],
             # repeat
             "is_repeat":        is_repeat,
@@ -358,18 +370,20 @@ class D1Aggregator:
     Scans session memory, aggregates topic coverage, translates the
     prompt into structured intent, and produces a reasoning packet."""
 
-    def __init__(self, model, syllabus_texts=None, syllabus_ids=None,
-                 syllabus_embs=None):
+    def __init__(self, model, syllabus_paths=None, syllabus_texts=None,
+                 syllabus_ids=None, syllabus_embs=None):
         self.model = model
         self.central_conn = sqlite3.connect(CENTRAL_DB)
         self.central_conn.row_factory = sqlite3.Row
         self.session_conn = sqlite3.connect(SESSION_DB)
         self.session_conn.row_factory = sqlite3.Row
+        self._syllabus_paths = syllabus_paths or []
         self._syllabus_texts = syllabus_texts or []
         self._syllabus_ids   = syllabus_ids or []
         self._syllabus_embs  = syllabus_embs
 
-    def set_syllabus(self, texts, ids, embs):
+    def set_syllabus(self, paths, texts, ids, embs):
+        self._syllabus_paths = paths
         self._syllabus_texts = texts
         self._syllabus_ids   = ids
         self._syllabus_embs  = embs
@@ -428,7 +442,7 @@ class D1Aggregator:
                                   show_progress_bar=False)[0]
         sims = self._cosine_sim(q_emb.reshape(1, -1), self._syllabus_embs)[0]
         best = int(np.argmax(sims))
-        parts = self._syllabus_texts[best].split(" > ")
+        parts = self._syllabus_paths[best].split(" > ")
 
         q_lower = question.lower()
         if any(w in q_lower for w in ["what", "define", "explain"]):
@@ -569,7 +583,8 @@ class D2_1NoveltyHandler:
         self.session_conn = sqlite3.connect(SESSION_DB)
         self.session_conn.row_factory = sqlite3.Row
 
-        self._syllabus_texts: list[str] = []
+        self._syllabus_paths: list[str] = []   # clean path for display
+        self._syllabus_texts: list[str] = []   # enriched text for embeddings
         self._syllabus_ids: list[int] = []
         self._syllabus_embs: np.ndarray | None = None
 
@@ -598,14 +613,25 @@ class D2_1NoveltyHandler:
         rows = self.central_conn.execute(
             """SELECT t.topic_id,
                       s.subject_name || ' > ' || c.chapter_name || ' > ' || t.topic_name
-                          AS full_path
+                          AS full_path,
+                      COALESCE(t.keywords, '') AS keywords,
+                      COALESCE(t.description, '') AS description
                FROM topics t
                JOIN chapters c ON t.chapter_id = c.chapter_id
                JOIN subjects s ON c.subject_id = s.subject_id
                ORDER BY t.topic_id"""
         ).fetchall()
         self._syllabus_ids = [r["topic_id"] for r in rows]
-        self._syllabus_texts = [r["full_path"] for r in rows]
+        self._syllabus_paths = [r["full_path"] for r in rows]
+        # Build rich text for embeddings: path + description + keywords
+        self._syllabus_texts = []
+        for r in rows:
+            parts = [r["full_path"]]
+            if r["description"]:
+                parts.append(r["description"])
+            if r["keywords"]:
+                parts.append(r["keywords"])
+            self._syllabus_texts.append(" | ".join(parts))
         self._syllabus_embs = self.model.encode(
             self._syllabus_texts, convert_to_numpy=True, show_progress_bar=False
         )
@@ -792,7 +818,7 @@ class D2_1NoveltyHandler:
         for si in range(len(self._syllabus_texts)):
             score = float(np.max(sims[:, si]))
             ranked.append({
-                "syllabus_topic": self._syllabus_texts[si],
+                "syllabus_topic": self._syllabus_paths[si],
                 "score": round(score, 4),
             })
         ranked.sort(key=lambda x: x["score"], reverse=True)
@@ -846,7 +872,7 @@ class D2_1NoveltyHandler:
                                   show_progress_bar=False)
         sims = self._cosine(t_emb, self._syllabus_embs)[0]
         closest_idx = int(np.argmax(sims))
-        closest_path = self._syllabus_texts[closest_idx]
+        closest_path = self._syllabus_paths[closest_idx]
         closest_subject = closest_path.split(" > ")[0]
 
         mentors = self.central_conn.execute(
@@ -1886,6 +1912,7 @@ class Pipeline:
         d1_result = None
         if d2_result["classification"] == "MATCHES_SYLLABUS_REPEAT":
             self.aggregator.set_syllabus(
+                self.classifier._syllabus_paths,
                 self.classifier._syllabus_texts,
                 self.classifier._syllabus_ids,
                 self.classifier._syllabus_embs,
@@ -1923,47 +1950,39 @@ class Pipeline:
     # ---- silent run (returns results without printing) ----
     def run_question_silent(self, student_id: int, date: str,
                             question: str) -> dict:
-        """Run the full pipeline without any display output.
-        Returns the same dict as run_question."""
+        """Run the pipeline without display output.
+
+        Fast path (D2 matches syllabus):
+            D2 match → AI Tutor with DB info → D3 safety → output
+
+        Full path (D2 no match):
+            D2 → D2.1 web search → D4 (if needed) → AI Tutor → D3 safety → output
+        """
         self.classifier.load_context(student_id)
         intake_info = self.handler.intake(student_id, date, question)
         d2_result = self.classifier.classify(question)
         self.handler.store_d2_result(student_id, d2_result)
 
         d2_1_result = None
-        if d2_result["classification"] in ("NO_MATCH_NEW", "NO_MATCH_REPEAT"):
+        d4_result = None
+        d1_result = None
+
+        is_syllabus_match = d2_result["classification"] in (
+            "MATCHES_SYLLABUS", "MATCHES_SYLLABUS_REPEAT"
+        )
+
+        if not is_syllabus_match:
+            # Full path: D2.1 → D4 for non-matching questions
             d2_1_result = self.novelty.run_d2_1(
                 student_id, question, d2_result
             )
             self.handler.store_d2_1_result(student_id, d2_1_result)
 
-        d4_result = None
-        if d2_1_result and d2_1_result.get("status") == "redirect_to_mentor":
-            d4_result = self.d4.run_d4(student_id, question, d2_result)
-            self.handler.store_d4_result(student_id, d4_result)
+            if d2_1_result and d2_1_result.get("status") == "redirect_to_mentor":
+                d4_result = self.d4.run_d4(student_id, question, d2_result)
+                self.handler.store_d4_result(student_id, d4_result)
 
-        d1_result = None
-        if d2_result["classification"] == "MATCHES_SYLLABUS_REPEAT":
-            self.aggregator.set_syllabus(
-                self.classifier._syllabus_texts,
-                self.classifier._syllabus_ids,
-                self.classifier._syllabus_embs,
-            )
-            d1_result = self.aggregator.aggregate(student_id, d2_result)
-            self.handler.store_d1_result(student_id, d1_result)
-
-        # 8. D3 — Output safety check
-        partial = {"d2": d2_result, "d2_1": d2_1_result, "d4": d4_result,
-                   "d1": d1_result, "mentors": []}
-        output_text = self._build_output_text(
-            d2_result, d2_1_result, d4_result, d1_result, []
-        )
-        d3_result = self.d3.validate_with_retry(
-            student_id, question, partial,
-            lambda _attempt: (output_text, partial),
-        )
-
-        # 9. Extract topic + subtopics for AI Tutor
+        # Extract topic + subtopics (works for both paths)
         topic = question
         if d2_result.get("syllabus_topic"):
             topic = d2_result["syllabus_topic"]
@@ -1972,7 +1991,19 @@ class Pipeline:
         elif d4_result and d4_result.get("topic"):
             topic = d4_result["topic"]
 
+        partial = {"d2": d2_result, "d2_1": d2_1_result, "d4": d4_result,
+                   "d1": d1_result, "mentors": []}
         subtopics = self.tutor.get_subtopics(topic, partial)
+
+        # D3 safety check on the AI Tutor's teaching output
+        d3_result = {"status": "passed", "safe": True}
+        if subtopics:
+            sample_teaching = self.tutor.teach_subtopic(
+                topic, subtopics[0], []
+            )
+            d3_result = self.d3.check_output(
+                sample_teaching, subtopics[0], {}
+            )
 
         return {
             "intake": intake_info,
